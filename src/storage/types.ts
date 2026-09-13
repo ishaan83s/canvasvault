@@ -16,3 +16,5 @@ export interface DrawingStorage {
 }
 
 export type SaveStatus = 'saved' | 'saving' | 'dirty' | 'error';
+
+export type { StorageMode, AuthMode } from './storageMode';

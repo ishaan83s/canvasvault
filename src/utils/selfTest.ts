@@ -1,5 +1,7 @@
 import { serializeDrawing, deserializeDrawing, ensureExcalidrawExtension, stripExcalidrawExtension, isValidExcalidrawJson } from './excalidrawSerialization';
 import { LocalStorageAdapter } from '../storage/localStorageAdapter';
+import { resolveStorageMode, resolveAuthMode } from '../storage/storageMode';
+import { StorageCoordinator } from '../storage/storageCoordinator';
 import type { ExcalidrawElement } from '@excalidraw/excalidraw/element/types';
 import type { BinaryFiles } from '@excalidraw/excalidraw/types';
 
@@ -725,6 +727,118 @@ export async function runPersistenceSelfTests(): Promise<{ passed: boolean; resu
       }
     }
     if (!caughtInvalid) throw new Error('createWithProperties failed to validate drawing content');
+  });
+
+  // 17. Storage mode selection, stable adapter identity, and generation rules
+  await record('17. Storage mode selection, stable adapter identity, and generation rules', () => {
+    // A. Storage mode type and selection
+    if (resolveStorageMode(false) !== 'local') throw new Error('resolveStorageMode(false) should be local');
+    if (resolveStorageMode(true) !== 'drive') throw new Error('resolveStorageMode(true) should be drive');
+    if (resolveAuthMode(false) !== 'anonymous') throw new Error('resolveAuthMode(false) should be anonymous');
+    if (resolveAuthMode(true) !== 'authenticated') throw new Error('resolveAuthMode(true) should be authenticated');
+
+    let tokenGetterCalls = 0;
+    let lastRetrievedToken: string | null = null;
+    const coordinator = new StorageCoordinator({
+      initialMode: 'local',
+      initialToken: 'initial_token_123',
+      createDriveAdapter: (getToken) => {
+        return {
+          create: async () => 'mock_id',
+          update: async () => {},
+          get: async () => {
+            tokenGetterCalls++;
+            lastRetrievedToken = getToken();
+            return '{}';
+          },
+          list: async () => [],
+          rename: async () => {},
+          delete: async () => {},
+        };
+      },
+    });
+
+    // Verify initial state
+    if (coordinator.getStorageMode() !== 'local') throw new Error('Expected initial mode local');
+    if (coordinator.getAuthMode() !== 'anonymous') throw new Error('Expected initial auth mode anonymous');
+    if (coordinator.getGeneration() !== 0) throw new Error('Expected initial generation 0');
+
+    // Verify active storage is selected by storageMode, not raw token presence
+    const initialActive = coordinator.getActiveStorage();
+    if (initialActive !== coordinator.getLocalStorage()) {
+      throw new Error('Active storage in local mode must be localStorage even when token is present');
+    }
+
+    // B. Transition to drive mode increments generation exactly once
+    const changedToDrive = coordinator.setStorageMode('drive');
+    if (!changedToDrive) throw new Error('setStorageMode(drive) should return true');
+    if (coordinator.getStorageMode() !== 'drive') throw new Error('Expected storage mode drive');
+    if (coordinator.getAuthMode() !== 'authenticated') throw new Error('Expected auth mode authenticated');
+    if (coordinator.getGeneration() !== 1) throw new Error('Expected generation 1 after transition');
+
+    // Redundant setStorageMode must be no-op and NOT increment generation
+    const redundantDrive = coordinator.setStorageMode('drive');
+    if (redundantDrive) throw new Error('Redundant setStorageMode(drive) should return false');
+    if (coordinator.getGeneration() !== 1) throw new Error('Generation should not increment on redundant mode set');
+
+    // C. Stable Drive adapter identity across token changes
+    const adapter1 = coordinator.getActiveStorage();
+    if (adapter1 === coordinator.getLocalStorage()) {
+      throw new Error('Active storage in drive mode must be Drive adapter');
+    }
+
+    // Simulate token refresh
+    coordinator.setToken('refreshed_token_456');
+    const adapter2 = coordinator.getActiveStorage();
+    if (adapter1 !== adapter2) {
+      throw new Error('Drive adapter identity must remain stable across token refresh');
+    }
+    if (coordinator.getGeneration() !== 1) {
+      throw new Error('Generation must NOT increment on token refresh');
+    }
+
+    // Second token refresh
+    coordinator.setToken('refreshed_token_789');
+    const adapter3 = coordinator.getActiveStorage();
+    if (adapter1 !== adapter3) {
+      throw new Error('Drive adapter identity changed on second token refresh');
+    }
+    if (coordinator.getGeneration() !== 1) {
+      throw new Error('Generation must NOT increment on second token refresh');
+    }
+
+    // D. Dynamic token getter returns the latest token
+    if (coordinator.getLatestToken() !== 'refreshed_token_789') {
+      throw new Error('getLatestToken() did not return updated token');
+    }
+    // Invoke adapter operation that reads getToken
+    adapter3.get('dummy');
+    if (lastRetrievedToken !== 'refreshed_token_789') {
+      throw new Error(`Dynamic getter returned stale token: ${lastRetrievedToken}`);
+    }
+
+    // E. Transition back to local increments generation
+    const changedToLocal = coordinator.setStorageMode('local');
+    if (!changedToLocal) throw new Error('setStorageMode(local) should return true');
+    if (coordinator.getStorageMode() !== 'local') throw new Error('Expected storage mode local');
+    if (coordinator.getGeneration() !== 2) throw new Error('Expected generation 2 after transition to local');
+    if (coordinator.getActiveStorage() !== coordinator.getLocalStorage()) {
+      throw new Error('Active storage must be localStorage after switching back to local');
+    }
+
+    // F. syncAuthState helper
+    const syncRes1 = coordinator.syncAuthState(true, 'new_token_sync');
+    if (!syncRes1.modeChanged || syncRes1.generation !== 3) {
+      throw new Error('syncAuthState(true) failed to transition to drive');
+    }
+    if (coordinator.getStorageMode() !== 'drive') throw new Error('Expected drive mode');
+    if (coordinator.getLatestToken() !== 'new_token_sync') throw new Error('Token not updated in syncAuthState');
+
+    // Token refresh via syncAuthState does NOT change mode or increment generation
+    const syncRes2 = coordinator.syncAuthState(true, 'refreshed_sync_token');
+    if (syncRes2.modeChanged || syncRes2.generation !== 3) {
+      throw new Error('Token refresh via syncAuthState must not increment generation');
+    }
   });
 
   const allPassed = results.every((r) => r.passed);

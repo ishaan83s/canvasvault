@@ -5,12 +5,16 @@ import { TopBar } from './components/TopBar';
 import { FileSidebar } from './components/FileSidebar';
 import { testLocalStorageAdapter } from './storage/localStorageAdapter';
 import { useDrawingPersistence } from './hooks/useDrawingPersistence';
+import { useStorageSelection } from './hooks/useStorageSelection';
 import { AuthProvider } from './auth/AuthProvider';
 import './App.css';
 
 function MainLayout() {
   const [excalidrawAPI, setExcalidrawAPI] = useState<ExcalidrawImperativeAPI | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(true);
+
+  // Storage selection foundation (switching wired in Unit 3)
+  useStorageSelection();
 
   const persistence = useDrawingPersistence({
     storage: testLocalStorageAdapter,
