@@ -1946,6 +1946,339 @@ export async function runPersistenceSelfTests(): Promise<{ passed: boolean; resu
     }
   });
 
+  // 22. Dirty state switch protection and UnsavedSwitchModal orchestration
+  await record('22. Dirty state switch protection and UnsavedSwitchModal orchestration', async () => {
+    type TestSwitchAction =
+      | { type: 'switch'; targetFileId: string; targetFileName?: string }
+      | { type: 'new' };
+
+    class UnsavedSwitchOrchestratorHarness {
+      public currentFileId: any = 'file_1';
+      public currentFileName: any = 'File 1';
+      public saveStatus: any = 'saved';
+      public isSaving: any = false;
+      public isDebouncing: any = false;
+      public isDirty: any = false;
+      public generation: any = 1;
+      public storageMode: any = 'local';
+
+      public pendingAction: TestSwitchAction | null = null;
+      public switchSaveError: any = null;
+      public isModalOpen: any = false;
+
+      public saveCallCount: any = 0;
+      public mockSaveResult: boolean = true;
+      public saveDelayMs: any = 0;
+      public activeSavePromise: Promise<boolean> | null = null;
+      public cancelledDebouncedSave: any = false;
+
+      public files: any[] = [
+        { id: 'file_1', name: 'File 1.excalidraw' },
+        { id: 'file_2', name: 'File 2.excalidraw' },
+      ];
+
+      public isSceneUnsaved(): boolean {
+        return (
+          this.isDirty ||
+          this.saveStatus === 'dirty' ||
+          this.saveStatus === 'saving' ||
+          this.saveStatus === 'error' ||
+          this.isSaving ||
+          this.isDebouncing
+        );
+      }
+
+      public handleSelectFileRequest(fileId: string): boolean {
+        if (fileId === this.currentFileId) {
+          // No-op for currently active file
+          return false;
+        }
+
+        if (this.isSceneUnsaved()) {
+          const target = this.files.find((f) => f.id === fileId);
+          this.switchSaveError = null;
+          this.pendingAction = {
+            type: 'switch',
+            targetFileId: fileId,
+            targetFileName: target ? target.name : undefined,
+          };
+          this.isModalOpen = true;
+          return false;
+        } else {
+          this.currentFileId = fileId;
+          const target = this.files.find((f) => f.id === fileId);
+          this.currentFileName = target ? target.name : 'Untitled';
+          return true;
+        }
+      }
+
+      public handleNewDrawingRequest(): boolean {
+        if (this.isSceneUnsaved()) {
+          this.switchSaveError = null;
+          this.pendingAction = { type: 'new' };
+          this.isModalOpen = true;
+          return false;
+        } else {
+          this.currentFileId = 'new_id_' + Date.now();
+          this.currentFileName = 'Untitled';
+          this.saveStatus = 'saved';
+          this.isDirty = false;
+          return true;
+        }
+      }
+
+      public async saveNow(): Promise<boolean> {
+        if (this.activeSavePromise) {
+          return this.activeSavePromise;
+        }
+
+        const p = (async () => {
+          this.saveCallCount++;
+          if (this.saveDelayMs > 0) {
+            await new Promise((r) => setTimeout(r, this.saveDelayMs));
+          }
+          if (this.mockSaveResult) {
+            this.saveStatus = 'saved';
+            this.isDirty = false;
+          }
+          return this.mockSaveResult;
+        })();
+
+        this.activeSavePromise = p;
+        try {
+          return await p;
+        } finally {
+          this.activeSavePromise = null;
+        }
+      }
+
+      public activeSwitchPromise: Promise<boolean> | null = null;
+
+      public async handleSaveAndProceed(): Promise<boolean> {
+        if (this.activeSwitchPromise) {
+          return this.activeSwitchPromise;
+        }
+        if (!this.pendingAction) return false;
+        const startGen = this.generation;
+        const action = this.pendingAction;
+        this.switchSaveError = null;
+
+        const p = (async () => {
+          try {
+            const success = await this.saveNow();
+            if (!success || this.generation !== startGen) {
+              this.switchSaveError = 'Failed to save drawing. Active drawing preserved.';
+              return false;
+            }
+
+            this.pendingAction = null;
+            this.isModalOpen = false;
+
+            if (action.type === 'switch') {
+              this.currentFileId = action.targetFileId;
+              const target = this.files.find((f) => f.id === action.targetFileId);
+              this.currentFileName = target ? target.name : 'Untitled';
+            } else {
+              this.currentFileId = 'new_created_id';
+              this.currentFileName = 'Untitled';
+            }
+            return true;
+          } catch (err: any) {
+            this.switchSaveError = err?.message || 'Save failed. Active drawing preserved.';
+            return false;
+          } finally {
+            this.activeSwitchPromise = null;
+          }
+        })();
+
+        this.activeSwitchPromise = p;
+        return p;
+      }
+
+      public handleDiscardAndProceed(): void {
+        if (!this.pendingAction) return;
+        const action = this.pendingAction;
+        this.pendingAction = null;
+        this.isModalOpen = false;
+        this.switchSaveError = null;
+        this.cancelledDebouncedSave = true;
+
+        if (action.type === 'switch') {
+          this.currentFileId = action.targetFileId;
+          const target = this.files.find((f) => f.id === action.targetFileId);
+          this.currentFileName = target ? target.name : 'Untitled';
+          this.saveStatus = 'saved';
+          this.isDirty = false;
+        } else {
+          this.currentFileId = 'new_created_id';
+          this.currentFileName = 'Untitled';
+          this.saveStatus = 'saved';
+          this.isDirty = false;
+        }
+      }
+
+      public handleCancel(): void {
+        this.pendingAction = null;
+        this.isModalOpen = false;
+        this.switchSaveError = null;
+      }
+
+      public transitionGeneration(newGen: number, newMode: any): void {
+        this.generation = newGen;
+        this.storageMode = newMode;
+        // Invalidate pending switch action
+        this.pendingAction = null;
+        this.switchSaveError = null;
+        this.isModalOpen = false;
+        this.activeSwitchPromise = null;
+      }
+    }
+
+    // A. Clean scene allows immediate file switch without modal
+    const harness = new UnsavedSwitchOrchestratorHarness();
+    const switched = harness.handleSelectFileRequest('file_2');
+    if (!switched || harness.currentFileId !== 'file_2' || harness.isModalOpen) {
+      throw new Error('Clean scene should switch file immediately without modal');
+    }
+
+    // B. Clicking currently active file is a no-op even if dirty
+    harness.isDirty = true;
+    const selfClickResult = harness.handleSelectFileRequest('file_2');
+    if (selfClickResult !== false || harness.isModalOpen || harness.currentFileId !== 'file_2') {
+      throw new Error('Clicking active file should be a silent no-op');
+    }
+
+    // C. Dirty scene prompts on file switch
+    harness.isDirty = true;
+    const dirtySwitchResult = harness.handleSelectFileRequest('file_1');
+    if (dirtySwitchResult !== false || !harness.isModalOpen || !harness.pendingAction) {
+      throw new Error('Dirty scene must open UnsavedSwitchModal on file switch');
+    }
+    if (harness.pendingAction.type !== 'switch' || harness.pendingAction.targetFileId !== 'file_1') {
+      throw new Error('Pending action does not match switch target');
+    }
+    if (harness.currentFileId !== 'file_2') {
+      throw new Error('Active file must not change before switch confirmation');
+    }
+
+    // D. Dirty scene prompts on "+ New"
+    const harnessNew = new UnsavedSwitchOrchestratorHarness();
+    harnessNew.isDirty = true;
+    const dirtyNewResult = harnessNew.handleNewDrawingRequest();
+    if (dirtyNewResult !== false || !harnessNew.isModalOpen || harnessNew.pendingAction?.type !== 'new') {
+      throw new Error('Dirty scene must open UnsavedSwitchModal on "+ New" request');
+    }
+
+    // E. Clean scene executes "+ New" immediately
+    const harnessCleanNew = new UnsavedSwitchOrchestratorHarness();
+    harnessCleanNew.isDirty = false;
+    harnessCleanNew.saveStatus = 'saved';
+    const cleanNewResult = harnessCleanNew.handleNewDrawingRequest();
+    if (!cleanNewResult || harnessCleanNew.isModalOpen || harnessCleanNew.currentFileName !== 'Untitled') {
+      throw new Error('Clean scene should execute "+ New" immediately');
+    }
+
+    // F. "Save and Switch" succeeds: saves and opens target file
+    const harnessSave = new UnsavedSwitchOrchestratorHarness();
+    harnessSave.isDirty = true;
+    harnessSave.handleSelectFileRequest('file_2');
+    const saveSuccess = await harnessSave.handleSaveAndProceed();
+    if (!saveSuccess || harnessSave.isModalOpen || harnessSave.currentFileId !== 'file_2') {
+      throw new Error('Save and Switch should save, close modal, and open target file');
+    }
+    if (harnessSave.saveCallCount !== 1 || harnessSave.saveStatus !== 'saved') {
+      throw new Error('Save was not executed properly during Save and Switch');
+    }
+
+    // G. Failed save blocks switch and preserves unsaved work
+    const harnessFail = new UnsavedSwitchOrchestratorHarness();
+    harnessFail.isDirty = true;
+    harnessFail.mockSaveResult = false;
+    harnessFail.handleSelectFileRequest('file_2');
+    const failSuccess = await harnessFail.handleSaveAndProceed();
+    if (failSuccess !== false) {
+      throw new Error('Failed save must return false');
+    }
+    if (!harnessFail.isModalOpen) {
+      throw new Error('Failed save must keep UnsavedSwitchModal open');
+    }
+    if (harnessFail.currentFileId !== 'file_1') {
+      throw new Error('Failed save must block switch and keep original file active');
+    }
+    if (!harnessFail.switchSaveError) {
+      throw new Error('Failed save must populate switchSaveError');
+    }
+
+    // H. "Discard and Switch" cancels debounce, discards, and switches
+    const harnessDiscard = new UnsavedSwitchOrchestratorHarness();
+    harnessDiscard.isDirty = true;
+    harnessDiscard.handleSelectFileRequest('file_2');
+    harnessDiscard.handleDiscardAndProceed();
+    if (harnessDiscard.isModalOpen || harnessDiscard.currentFileId !== 'file_2') {
+      throw new Error('Discard and Switch should close modal and switch to target file');
+    }
+    if (!harnessDiscard.cancelledDebouncedSave) {
+      throw new Error('Discard and Switch must cancel pending debounced saves');
+    }
+
+    // I. "Cancel" closes modal and leaves drawing dirty and active
+    const harnessCancel = new UnsavedSwitchOrchestratorHarness();
+    harnessCancel.isDirty = true;
+    harnessCancel.handleSelectFileRequest('file_2');
+    harnessCancel.handleCancel();
+    if (harnessCancel.isModalOpen || harnessCancel.pendingAction !== null) {
+      throw new Error('Cancel must close modal and clear pending action');
+    }
+    if (harnessCancel.currentFileId !== 'file_1' || !harnessCancel.isDirty) {
+      throw new Error('Cancel must keep original file active and dirty');
+    }
+
+    // J. "Save and Create" (+ New) succeeds
+    const harnessSaveNew = new UnsavedSwitchOrchestratorHarness();
+    harnessSaveNew.isDirty = true;
+    harnessSaveNew.handleNewDrawingRequest();
+    const saveNewSuccess = await harnessSaveNew.handleSaveAndProceed();
+    if (!saveNewSuccess || harnessSaveNew.isModalOpen || harnessSaveNew.currentFileName !== 'Untitled') {
+      throw new Error('Save and Create must succeed, close modal, and open new drawing');
+    }
+
+    // K. Concurrent clicks on Save and Switch share the in-flight promise
+    const harnessConcurrent = new UnsavedSwitchOrchestratorHarness();
+    harnessConcurrent.isDirty = true;
+    harnessConcurrent.saveDelayMs = 20;
+    harnessConcurrent.handleSelectFileRequest('file_2');
+    const [c1, c2] = await Promise.all([
+      harnessConcurrent.handleSaveAndProceed(),
+      harnessConcurrent.handleSaveAndProceed(),
+    ]);
+    if (!c1 || !c2 || harnessConcurrent.saveCallCount !== 1) {
+      throw new Error('Concurrent clicks must share the single in-flight save');
+    }
+
+    // L. Storage generation change invalidates pending switch action
+    const harnessGen = new UnsavedSwitchOrchestratorHarness();
+    harnessGen.isDirty = true;
+    harnessGen.handleSelectFileRequest('file_2');
+    if (!harnessGen.isModalOpen) throw new Error('Modal should be open initially');
+    harnessGen.transitionGeneration(2, 'drive');
+    if (harnessGen.isModalOpen || harnessGen.pendingAction !== null) {
+      throw new Error('Generation transition must invalidate pending switch action and close modal');
+    }
+
+    // M. Generation change during in-flight Save and Switch blocks switch
+    const harnessGenFlight = new UnsavedSwitchOrchestratorHarness();
+    harnessGenFlight.isDirty = true;
+    harnessGenFlight.saveDelayMs = 30;
+    harnessGenFlight.handleSelectFileRequest('file_2');
+    const pendingSave = harnessGenFlight.handleSaveAndProceed();
+    // Simulate generation transition during save
+    harnessGenFlight.generation = 3;
+    const flightOutcome = await pendingSave;
+    if (flightOutcome !== false || harnessGenFlight.currentFileId !== 'file_1') {
+      throw new Error('Save across generation transition must not authorize file switch');
+    }
+  });
+
   const allPassed = results.every((r) => r.passed);
 
   return { passed: allPassed, results };

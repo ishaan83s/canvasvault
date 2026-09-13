@@ -541,6 +541,7 @@ export function useDrawingPersistence({
     saveStatus,
     isDirty: saveStatus === 'dirty',
     isSaving,
+    isDebouncing,
     isOpeningFile,
     isFileOperating,
     isSignOutSafe:

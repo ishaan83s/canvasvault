@@ -5,11 +5,13 @@ import { TopBar } from './components/TopBar';
 import { FileSidebar } from './components/FileSidebar';
 import { StorageMigrationModal } from './components/StorageMigrationModal';
 import { SignOutConfirmationModal } from './components/SignOutConfirmationModal';
+import { UnsavedSwitchModal, type PendingSwitchAction } from './components/UnsavedSwitchModal';
 import { useDrawingPersistence } from './hooks/useDrawingPersistence';
 import { AuthProvider } from './auth/AuthProvider';
 import { useAuth } from './auth/AuthContext';
 import { testLocalStorageAdapter } from './storage/localStorageAdapter';
 import { migrateLocalDrawingsToDrive, type MigrationDriveTarget } from './storage/migrationService';
+import { stripExcalidrawExtension } from './utils/excalidrawSerialization';
 import './App.css';
 
 function MainLayout() {
@@ -134,6 +136,113 @@ function MainLayout() {
     setSignOutSaveError(null);
   };
 
+  const [pendingSwitchAction, setPendingSwitchAction] = useState<PendingSwitchAction | null>(null);
+  const [switchSaveError, setSwitchSaveError] = useState<string | null>(null);
+  const activeSwitchPromiseRef = useRef<Promise<boolean> | null>(null);
+
+  // Invalidate any pending switch action across storage mode transitions or sign-out
+  const [prevSwitchGen, setPrevSwitchGen] = useState(persistence.generation);
+  const [prevSwitchMode, setPrevSwitchMode] = useState(persistence.storageMode);
+  if (prevSwitchGen !== persistence.generation || prevSwitchMode !== persistence.storageMode) {
+    setPrevSwitchGen(persistence.generation);
+    setPrevSwitchMode(persistence.storageMode);
+    setPendingSwitchAction(null);
+    setSwitchSaveError(null);
+    activeSwitchPromiseRef.current = null;
+  }
+
+  const isSceneUnsaved =
+    persistence.isDirty ||
+    persistence.saveStatus === 'dirty' ||
+    persistence.saveStatus === 'saving' ||
+    persistence.saveStatus === 'error' ||
+    persistence.isSaving ||
+    persistence.isDebouncing;
+
+  const handleSelectFileRequest = (fileId: string) => {
+    // If clicking currently active file, no-op!
+    if (fileId === persistence.currentFileId) {
+      return;
+    }
+
+    if (isSceneUnsaved) {
+      const targetFile = persistence.files.find((f) => f.id === fileId);
+      const targetName = targetFile ? stripExcalidrawExtension(targetFile.name) : undefined;
+      setSwitchSaveError(null);
+      setPendingSwitchAction({ type: 'switch', targetFileId: fileId, targetFileName: targetName });
+    } else {
+      persistence.openDrawing(fileId);
+    }
+  };
+
+  const handleNewDrawingRequest = () => {
+    if (isSceneUnsaved) {
+      setSwitchSaveError(null);
+      setPendingSwitchAction({ type: 'new' });
+    } else {
+      persistence.createNewDrawing('Untitled');
+    }
+  };
+
+  const handleSaveAndProceedSwitch = async (): Promise<boolean> => {
+    if (activeSwitchPromiseRef.current) {
+      return activeSwitchPromiseRef.current;
+    }
+    if (!pendingSwitchAction) return false;
+    const startGen = persistence.generation;
+    const action = pendingSwitchAction;
+    setSwitchSaveError(null);
+
+    const switchPromise = (async () => {
+      try {
+        const success = await persistence.saveNow();
+        if (!success || persistence.generation !== startGen) {
+          setSwitchSaveError(
+            persistence.errorMessage || 'Failed to save drawing. Active drawing preserved.'
+          );
+          return false;
+        }
+
+        setPendingSwitchAction(null);
+
+        if (action.type === 'switch') {
+          await persistence.openDrawing(action.targetFileId);
+        } else {
+          await persistence.createNewDrawing('Untitled');
+        }
+        return true;
+      } catch (err) {
+        setSwitchSaveError(err instanceof Error ? err.message : 'Save failed. Active drawing preserved.');
+        return false;
+      } finally {
+        activeSwitchPromiseRef.current = null;
+      }
+    })();
+
+    activeSwitchPromiseRef.current = switchPromise;
+    return switchPromise;
+  };
+
+  const handleDiscardAndProceedSwitch = () => {
+    if (!pendingSwitchAction) return;
+    const action = pendingSwitchAction;
+    setPendingSwitchAction(null);
+    setSwitchSaveError(null);
+
+    persistence.cancelPendingSave();
+
+    if (action.type === 'switch') {
+      persistence.openDrawing(action.targetFileId);
+    } else {
+      persistence.createNewDrawing('Untitled');
+    }
+  };
+
+  const handleCancelSwitch = () => {
+    setPendingSwitchAction(null);
+    setSwitchSaveError(null);
+  };
+
   return (
     <div className="app-container">
       <TopBar
@@ -143,7 +252,7 @@ function MainLayout() {
         saveStatus={persistence.saveStatus}
         lastSavedAt={persistence.lastSavedAt}
         onSave={persistence.saveNow}
-        onNew={() => persistence.createNewDrawing('Untitled')}
+        onNew={handleNewDrawingRequest}
         onRename={(newName) => {
           if (persistence.currentFileId) {
             persistence.renameDrawing(persistence.currentFileId, newName);
@@ -156,8 +265,8 @@ function MainLayout() {
           isOpen={isSidebarOpen}
           files={persistence.files}
           currentFileId={persistence.currentFileId}
-          onSelectFile={persistence.openDrawing}
-          onNewFile={() => persistence.createNewDrawing('Untitled')}
+          onSelectFile={handleSelectFileRequest}
+          onNewFile={handleNewDrawingRequest}
           onRenameFile={persistence.renameDrawing}
           onDeleteFile={persistence.deleteDrawing}
         />
@@ -199,6 +308,20 @@ function MainLayout() {
         onSignOutWithoutSaving={handleSignOutWithoutSaving}
         onCancel={handleCancelSignOut}
         saveErrorMessage={signOutSaveError}
+      />
+      <UnsavedSwitchModal
+        key={
+          pendingSwitchAction
+            ? `${pendingSwitchAction.type}-${pendingSwitchAction.type === 'switch' ? pendingSwitchAction.targetFileId : 'new'}`
+            : 'closed'
+        }
+        isOpen={pendingSwitchAction !== null && !isSignOutModalOpen}
+        currentFileName={persistence.currentFileName}
+        pendingAction={pendingSwitchAction}
+        onSaveAndProceed={handleSaveAndProceedSwitch}
+        onDiscardAndProceed={handleDiscardAndProceedSwitch}
+        onCancel={handleCancelSwitch}
+        saveErrorMessage={switchSaveError}
       />
     </div>
   );
