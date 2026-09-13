@@ -259,18 +259,25 @@ export class GoogleDriveClient {
   /**
    * Uploads a new drawing file via Drive API v3 multipart upload.
    */
-  async createMultipartFile(name: string, content: string): Promise<DriveFileMetadata> {
+  async createMultipartFile(
+    name: string,
+    content: string,
+    extraAppProperties?: Record<string, string>
+  ): Promise<DriveFileMetadata> {
     const folderId = await this.getOrCreateFolder();
     const boundary = `CanvasVaultBoundary${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+
+    const appProperties = {
+      ...extraAppProperties,
+      app: CANVASVAULT_APP_KEY,
+      type: CANVASVAULT_DRAWING_TYPE,
+    };
 
     const metadata = {
       name,
       parents: [folderId],
       mimeType: 'application/json',
-      appProperties: {
-        app: CANVASVAULT_APP_KEY,
-        type: CANVASVAULT_DRAWING_TYPE,
-      },
+      appProperties,
     };
 
     const multipartBody =

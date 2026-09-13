@@ -58,6 +58,22 @@ export class GoogleDriveAdapter implements DrawingStorage {
   }
 
   /**
+   * Creates a new drawing file with optional additive appProperties (e.g. migration markers).
+   * Does not bypass validation, extension checks, or mandatory CanvasVault ownership markers.
+   */
+  async createWithProperties(
+    name: string,
+    content: string,
+    extraAppProperties?: Record<string, string>
+  ): Promise<string> {
+    this.assertValidDrawingContent(content);
+    const safeName = ensureExcalidrawExtension(name || 'Untitled');
+
+    const file = await this.client.createMultipartFile(safeName, content, extraAppProperties);
+    return file.id;
+  }
+
+  /**
    * Updates an existing drawing file's content in-place.
    * Enforces centralized ownership validation before mutation.
    */

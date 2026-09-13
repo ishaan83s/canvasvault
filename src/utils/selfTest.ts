@@ -657,6 +657,76 @@ export async function runPersistenceSelfTests(): Promise<{ passed: boolean; resu
     }
   });
 
+  // 16. Migration metadata support and marker protection
+  await record('16. Google Drive: Migration metadata support and marker protection', async () => {
+    let capturedMetadata: any = null;
+
+    const mockFetch = createMockFetch((url, init) => {
+      if (url.includes('/drive/v3/files?') && (!init || !init.method || init.method === 'GET')) {
+        return jsonResponse(200, { files: [{ id: FOLDER_ID }] });
+      }
+      if (url.includes('/upload/drive/v3/files?uploadType=multipart')) {
+        const bodyStr = String(init?.body || '');
+        // Extract Part 1 JSON metadata
+        const parts = bodyStr.split(/\r?\n\r?\n/);
+        if (parts.length >= 2) {
+          capturedMetadata = JSON.parse(parts[1].split(/\r?\n--/)[0]);
+        }
+        return jsonResponse(200, { id: 'migrated_file_123' });
+      }
+      return jsonResponse(404, {});
+    });
+
+    const adapter = new GoogleDriveAdapter({
+      getToken: () => MOCK_TOKEN,
+      fetchFn: mockFetch,
+    });
+
+    // Step A: Normal createWithProperties merges sourceLocalId and migratedAt
+    const fileId = await adapter.createWithProperties('Imported Plan', serializedJson, {
+      sourceLocalId: 'loc_file_789',
+      migratedAt: '2026-09-13T12:00:00.000Z',
+    });
+    if (fileId !== 'migrated_file_123') throw new Error('createWithProperties failed to return fileId');
+    if (!capturedMetadata) throw new Error('Failed to capture multipart metadata');
+    if (capturedMetadata.name !== 'Imported Plan.excalidraw') throw new Error('Extension was not appended');
+    if (capturedMetadata.appProperties?.sourceLocalId !== 'loc_file_789') {
+      throw new Error('sourceLocalId missing from appProperties');
+    }
+    if (capturedMetadata.appProperties?.migratedAt !== '2026-09-13T12:00:00.000Z') {
+      throw new Error('migratedAt missing from appProperties');
+    }
+    if (capturedMetadata.appProperties?.app !== 'canvasvault') throw new Error('Mandatory app marker was lost');
+    if (capturedMetadata.appProperties?.type !== 'drawing') throw new Error('Mandatory type marker was lost');
+
+    // Step B: Attempting to override mandatory markers fails closed
+    await adapter.createWithProperties('Protected', serializedJson, {
+      app: 'malicious_override',
+      type: 'fake_type',
+      sourceLocalId: 'loc_safe_id',
+    });
+    if (capturedMetadata.appProperties?.app !== 'canvasvault') {
+      throw new Error('Caller was able to override mandatory app marker!');
+    }
+    if (capturedMetadata.appProperties?.type !== 'drawing') {
+      throw new Error('Caller was able to override mandatory type marker!');
+    }
+    if (capturedMetadata.appProperties?.sourceLocalId !== 'loc_safe_id') {
+      throw new Error('Caller sourceLocalId was not preserved');
+    }
+
+    // Step C: Content validation is preserved
+    let caughtInvalid = false;
+    try {
+      await adapter.createWithProperties('Bad Content', '{"not":"excalidraw"}', { sourceLocalId: 'test' });
+    } catch (err) {
+      if (err instanceof GoogleDriveError && err.code === 'INVALID_CONTENT') {
+        caughtInvalid = true;
+      }
+    }
+    if (!caughtInvalid) throw new Error('createWithProperties failed to validate drawing content');
+  });
+
   const allPassed = results.every((r) => r.passed);
   return { passed: allPassed, results };
 }
