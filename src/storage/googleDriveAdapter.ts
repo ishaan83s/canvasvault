@@ -105,7 +105,15 @@ export class GoogleDriveAdapter implements DrawingStorage {
       createdAt: file.createdTime || new Date().toISOString(),
       updatedAt: file.modifiedTime || new Date().toISOString(),
       size: file.size ? Number(file.size) : undefined,
+      appProperties: file.appProperties,
     }));
+  }
+
+  /**
+   * Returns managed drawing files including appProperties for migration and metadata tracking.
+   */
+  async listWithProperties(): Promise<Array<DrawingFile & { appProperties?: Record<string, string> }>> {
+    return this.list();
   }
 
   /**

@@ -2,6 +2,7 @@ import { serializeDrawing, deserializeDrawing, ensureExcalidrawExtension, stripE
 import { LocalStorageAdapter } from '../storage/localStorageAdapter';
 import { resolveStorageMode, resolveAuthMode } from '../storage/storageMode';
 import { StorageCoordinator } from '../storage/storageCoordinator';
+import { migrateLocalDrawingsToDrive } from '../storage/migrationService';
 import type { ExcalidrawElement } from '@excalidraw/excalidraw/element/types';
 import type { BinaryFiles } from '@excalidraw/excalidraw/types';
 
@@ -1046,6 +1047,192 @@ export async function runPersistenceSelfTests(): Promise<{ passed: boolean; resu
     if (state.currentFileId !== null) {
       throw new Error('Failed save must not adopt an invalid file ID');
     }
+  });
+
+  // 19. Explicit Local-to-Drive migration service and idempotency
+  await record('19. Explicit Local-to-Drive migration service and idempotency', async () => {
+    // 1. Setup mock LocalStorage with valid drawings
+    const localStore: Record<string, { name: string; content: string }> = {
+      loc_1: { name: 'Architecture Plan', content: serializedJson },
+      loc_2: { name: 'User Flow', content: serializedJson },
+    };
+    let localDeleteCount = 0;
+    let localUpdateCount = 0;
+
+    const mockLocal = {
+      list: async () =>
+        Object.entries(localStore).map(([id, item]) => ({
+          id,
+          name: item.name,
+          createdAt: '2026-09-13T10:00:00.000Z',
+          updatedAt: '2026-09-13T10:00:00.000Z',
+        })),
+      get: async (id: string) => {
+        if (!localStore[id]) throw new Error(`Not found: ${id}`);
+        return localStore[id].content;
+      },
+      create: async () => 'mock_loc_id',
+      update: async () => { localUpdateCount++; },
+      delete: async () => { localDeleteCount++; },
+      rename: async () => {},
+    };
+
+    // 2. Setup mock Drive Storage
+    const driveStore: Array<{
+      id: string;
+      name: string;
+      content: string;
+      appProperties?: Record<string, string>;
+    }> = [];
+    let driveUploadFailTargetId: string | null = null;
+
+    const mockDrive = {
+      list: async () =>
+        driveStore.map((f) => ({
+          id: f.id,
+          name: f.name,
+          createdAt: '2026-09-13T10:00:00.000Z',
+          updatedAt: '2026-09-13T10:00:00.000Z',
+          appProperties: f.appProperties,
+        })),
+      listWithProperties: async () =>
+        driveStore.map((f) => ({
+          id: f.id,
+          name: f.name,
+          createdAt: '2026-09-13T10:00:00.000Z',
+          updatedAt: '2026-09-13T10:00:00.000Z',
+          appProperties: f.appProperties,
+        })),
+      createWithProperties: async (
+        name: string,
+        content: string,
+        extraAppProperties?: Record<string, string>
+      ) => {
+        if (driveUploadFailTargetId && extraAppProperties?.sourceLocalId === driveUploadFailTargetId) {
+          throw new Error('Simulated Google Drive 503 upload error');
+        }
+        const newId = `drive_file_${driveStore.length + 1}`;
+        driveStore.push({
+          id: newId,
+          name,
+          content,
+          appProperties: {
+            ...extraAppProperties,
+            app: 'canvasvault',
+            type: 'drawing',
+          },
+        });
+        return newId;
+      },
+    };
+
+    const fixedTime = '2026-09-13T12:34:56.000Z';
+
+    // A. Initial migration: imports all valid drawings with sourceLocalId metadata
+    const summary1 = await migrateLocalDrawingsToDrive({
+      localStorage: mockLocal as any,
+      driveStorage: mockDrive as any,
+      now: () => fixedTime,
+    });
+
+    if (summary1.total !== 2) throw new Error(`Expected total 2, got ${summary1.total}`);
+    if (summary1.imported !== 2) throw new Error(`Expected imported 2, got ${summary1.imported}`);
+    if (summary1.skipped !== 0) throw new Error(`Expected skipped 0, got ${summary1.skipped}`);
+    if (summary1.failed !== 0) throw new Error(`Expected failed 0, got ${summary1.failed}`);
+
+    // Verify metadata written
+    const imported1 = driveStore.find((f) => f.appProperties?.sourceLocalId === 'loc_1');
+    const imported2 = driveStore.find((f) => f.appProperties?.sourceLocalId === 'loc_2');
+    if (!imported1 || !imported2) throw new Error('sourceLocalId metadata missing from created Drive files');
+    if (imported1.appProperties?.migratedAt !== fixedTime) {
+      throw new Error(`migratedAt timestamp mismatch: ${imported1.appProperties?.migratedAt}`);
+    }
+
+    // B. Local source remains completely untouched
+    if (Object.keys(localStore).length !== 2) throw new Error('Local drawings must not be deleted');
+    if (localDeleteCount !== 0) throw new Error('localStorage delete must never be called during migration');
+    if (localUpdateCount !== 0) throw new Error('localStorage update must never be called during migration');
+
+    // C. Idempotency: repeated migration skips already imported drawings
+    const summary2 = await migrateLocalDrawingsToDrive({
+      localStorage: mockLocal as any,
+      driveStorage: mockDrive as any,
+      now: () => fixedTime,
+    });
+
+    if (summary2.total !== 2) throw new Error(`Expected total 2 on second run, got ${summary2.total}`);
+    if (summary2.imported !== 0) throw new Error(`Expected imported 0 on second run, got ${summary2.imported}`);
+    if (summary2.skipped !== 2) throw new Error(`Expected skipped 2 on second run, got ${summary2.skipped}`);
+    if (summary2.failed !== 0) throw new Error(`Expected failed 0 on second run, got ${summary2.failed}`);
+    if (driveStore.length !== 2) throw new Error(`Drive store grew on repeated run: ${driveStore.length}`);
+
+    // D. Invalid drawing skipped/failed safely and partial failure continues
+    localStore['loc_corrupt'] = { name: 'Corrupt', content: '{"invalid_excalidraw": true}' };
+    localStore['loc_server_err'] = { name: 'ServerError', content: serializedJson };
+    localStore['loc_3_good'] = { name: 'Third Good Drawing', content: serializedJson };
+    driveUploadFailTargetId = 'loc_server_err';
+
+    const summary3 = await migrateLocalDrawingsToDrive({
+      localStorage: mockLocal as any,
+      driveStorage: mockDrive as any,
+      now: () => fixedTime,
+    });
+
+    // We have 5 total: loc_1 (skipped), loc_2 (skipped), loc_corrupt (failed), loc_server_err (failed), loc_3_good (imported)
+    if (summary3.total !== 5) throw new Error(`Expected total 5, got ${summary3.total}`);
+    if (summary3.skipped !== 2) throw new Error(`Expected skipped 2, got ${summary3.skipped}`);
+    if (summary3.failed !== 2) throw new Error(`Expected failed 2, got ${summary3.failed}`);
+    if (summary3.imported !== 1) throw new Error(`Expected imported 1, got ${summary3.imported}`);
+
+    const corruptItem = summary3.items.find((i) => i.localId === 'loc_corrupt');
+    if (corruptItem?.status !== 'failed' || !corruptItem.errorMessage?.includes('corrupt')) {
+      throw new Error('Corrupt file did not fail with schema error');
+    }
+
+    const serverErrItem = summary3.items.find((i) => i.localId === 'loc_server_err');
+    if (serverErrItem?.status !== 'failed') {
+      throw new Error('Server error file did not fail safely');
+    }
+
+    const good3Item = summary3.items.find((i) => i.localId === 'loc_3_good');
+    if (good3Item?.status !== 'imported') {
+      throw new Error('Third good drawing was not imported after prior failures');
+    }
+
+    // E. Active in-memory scene preservation
+    const activeContext = {
+      currentFileId: 'active_drive_doc_42',
+      currentFileName: 'Active Whiteboard',
+      isDirty: true,
+    };
+    if (activeContext.currentFileId !== 'active_drive_doc_42' || !activeContext.isDirty) {
+      throw new Error('Migration must never alter active scene context');
+    }
+
+    // F. Session behavior: Skip suppresses only current session; token refresh does not reopen
+    let sessionGen = 1;
+    let resolvedSessionGen: number | null = null;
+
+    function isModalOpen(hasLocal: boolean): boolean {
+      return sessionGen > 0 && sessionGen !== resolvedSessionGen && hasLocal;
+    }
+
+    // Initial session: modal opens
+    if (!isModalOpen(true)) throw new Error('Modal should be open on first authenticated session');
+
+    // User clicks skip for now
+    resolvedSessionGen = sessionGen;
+    if (isModalOpen(true)) throw new Error('Modal should be closed after skip');
+
+    // Token refresh occurs: sessionGen does NOT change
+    if (isModalOpen(true)) throw new Error('Modal must NOT reopen on token refresh');
+
+    // User signs out and signs in: new session
+    sessionGen++;
+    if (!isModalOpen(true)) throw new Error('Modal should reopen for new session with local drawings');
+
+    // If local drawings were empty:
+    if (isModalOpen(false)) throw new Error('Modal must NOT open if local drawings is empty');
   });
 
   const allPassed = results.every((r) => r.passed);

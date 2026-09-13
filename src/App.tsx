@@ -1,19 +1,90 @@
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import type { ExcalidrawImperativeAPI } from '@excalidraw/excalidraw/types';
 import { Whiteboard } from './components/Whiteboard';
 import { TopBar } from './components/TopBar';
 import { FileSidebar } from './components/FileSidebar';
+import { StorageMigrationModal } from './components/StorageMigrationModal';
 import { useDrawingPersistence } from './hooks/useDrawingPersistence';
 import { AuthProvider } from './auth/AuthProvider';
+import { useAuth } from './auth/AuthContext';
+import { testLocalStorageAdapter } from './storage/localStorageAdapter';
+import { migrateLocalDrawingsToDrive, type MigrationDriveTarget } from './storage/migrationService';
 import './App.css';
 
 function MainLayout() {
   const [excalidrawAPI, setExcalidrawAPI] = useState<ExcalidrawImperativeAPI | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(true);
 
+  const auth = useAuth();
+  const isAuthenticated = auth.state.status === 'authenticated' && !!auth.state.accessToken;
+
+  // Session-generation tracking: changes only on actual sign-in, not token refresh
+  const [sessionGen, setSessionGen] = useState<number>(0);
+  const [resolvedSessionGen, setResolvedSessionGen] = useState<number | null>(null);
+  const prevAuthRef = useRef<boolean>(false);
+  const [localDrawingCount, setLocalDrawingCount] = useState<number>(0);
+
   const persistence = useDrawingPersistence({
     api: excalidrawAPI,
   });
+
+  useEffect(() => {
+    if (!prevAuthRef.current && isAuthenticated) {
+      setSessionGen((g) => g + 1);
+    }
+    prevAuthRef.current = isAuthenticated;
+  }, [isAuthenticated]);
+
+  // Inspect local storage drawings when a new authenticated session starts
+  useEffect(() => {
+    if (!isAuthenticated || sessionGen === 0 || sessionGen === resolvedSessionGen) {
+      return;
+    }
+
+    let isMounted = true;
+    testLocalStorageAdapter
+      .list()
+      .then((localFiles) => {
+        if (!isMounted) return;
+        setLocalDrawingCount(localFiles.length);
+        if (localFiles.length === 0) {
+          setResolvedSessionGen(sessionGen);
+        }
+      })
+      .catch((err) => {
+        console.warn('Failed to inspect local storage for migration:', err);
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, [isAuthenticated, sessionGen, resolvedSessionGen]);
+
+  const isMigrationModalOpen =
+    isAuthenticated &&
+    sessionGen > 0 &&
+    sessionGen !== resolvedSessionGen &&
+    localDrawingCount > 0;
+
+  const handleSkipMigration = () => {
+    setResolvedSessionGen(sessionGen);
+  };
+
+  const handleImportMigration = async () => {
+    if (!persistence.driveAdapter) {
+      throw new Error('Google Drive adapter is not ready');
+    }
+    return migrateLocalDrawingsToDrive({
+      localStorage: testLocalStorageAdapter,
+      driveStorage: persistence.driveAdapter as unknown as MigrationDriveTarget,
+    });
+  };
+
+  const handleCloseMigration = () => {
+    setResolvedSessionGen(sessionGen);
+    // Refresh sidebar files from Drive without touching active scene
+    persistence.refreshFiles();
+  };
 
   return (
     <div className="app-container">
@@ -66,6 +137,13 @@ function MainLayout() {
           />
         </main>
       </div>
+      <StorageMigrationModal
+        isOpen={isMigrationModalOpen}
+        localDrawingCount={localDrawingCount}
+        onImport={handleImportMigration}
+        onSkip={handleSkipMigration}
+        onClose={handleCloseMigration}
+      />
     </div>
   );
 }

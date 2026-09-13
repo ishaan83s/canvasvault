@@ -4,6 +4,7 @@ export interface DrawingFile {
   createdAt: string; // ISO timestamp
   updatedAt: string; // ISO timestamp
   size?: number; // size in bytes
+  appProperties?: Record<string, string>;
 }
 
 export interface DrawingStorage {

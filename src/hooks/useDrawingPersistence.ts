@@ -403,6 +403,7 @@ export function useDrawingPersistence({
     storageMode,
     generation,
     activeStorage: storage,
+    driveAdapter: selection.driveAdapter,
     saveNow: executeSave,
     handleCanvasChange,
     openDrawing,
