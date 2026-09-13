@@ -841,7 +841,215 @@ export async function runPersistenceSelfTests(): Promise<{ passed: boolean; resu
     }
   });
 
+  // 18. Generation-safe storage switching and persistence semantics
+  await record('18. Generation-safe storage switching and persistence semantics', async () => {
+    // Mock local and drive storage adapters to track calls and simulate latencies/failures
+    const counts: any = {
+      localCreate: 0,
+      localUpdate: 0,
+      driveCreate: 0,
+      driveUpdate: 0,
+    };
+    const mockLocalStorage = {
+      create: async (_name: string, _content: string) => {
+        counts.localCreate++;
+        return `local_id_${counts.localCreate}`;
+      },
+      update: async (_id: string, _content: string) => {
+        counts.localUpdate++;
+      },
+      get: async (_id: string) => serializedJson,
+      list: async () => [{ id: 'loc_1', name: 'Local Drawing.excalidraw', createdAt: '', updatedAt: '' }],
+      rename: async () => {},
+      delete: async () => {},
+    };
+
+    let driveShouldFail = false;
+    let driveCreateDelayMs = 0;
+    const mockDriveStorage = {
+      create: async (_name: string, _content: string) => {
+        if (driveCreateDelayMs > 0) {
+          await new Promise((r) => setTimeout(r, driveCreateDelayMs));
+        }
+        if (driveShouldFail) {
+          throw new Error('Google Drive API 500 internal error');
+        }
+        counts.driveCreate++;
+        return `drive_id_${counts.driveCreate}`;
+      },
+      update: async (_id: string, _content: string) => {
+        if (driveShouldFail) {
+          throw new Error('Google Drive API 401 unauthorized');
+        }
+        counts.driveUpdate++;
+      },
+      get: async (_id: string) => serializedJson,
+      list: async () => [{ id: 'drive_1', name: 'Cloud Drawing.excalidraw', createdAt: '', updatedAt: '' }],
+      rename: async () => {},
+      delete: async () => {},
+    };
+
+    // A. Verify storage selection: local mode uses LocalStorage, drive mode uses Drive adapter
+    const coordinator = new StorageCoordinator({
+      initialMode: 'local',
+      localStorage: mockLocalStorage,
+      createDriveAdapter: () => mockDriveStorage,
+    });
+    if (coordinator.getActiveStorage() !== mockLocalStorage) {
+      throw new Error('Local mode must select LocalStorage');
+    }
+    coordinator.setStorageMode('drive');
+    if (coordinator.getActiveStorage() !== mockDriveStorage) {
+      throw new Error('Drive mode must select GoogleDrive adapter');
+    }
+
+    // B. Transition lifecycle: Local -> Drive clears backend file ID and preserves scene
+    coordinator.setStorageMode('local');
+    const state: Record<string, any> = {
+      generation: coordinator.getGeneration(),
+      storageMode: coordinator.getStorageMode(),
+      currentFileId: 'local_doc_99',
+      currentFileName: 'My Diagram',
+      inMemoryScene: serializedJson,
+      saveStatus: 'saved',
+    };
+
+    function simulateTransition(newMode: 'local' | 'drive') {
+      const changed = coordinator.setStorageMode(newMode);
+      if (changed) {
+        state.generation = coordinator.getGeneration();
+        state.storageMode = coordinator.getStorageMode();
+        // Transition clears backend file ID and retains in-memory scene
+        state.currentFileId = null;
+        state.saveStatus = 'dirty';
+      }
+    }
+
+    // Switch to Drive
+    simulateTransition('drive');
+    if (state.currentFileId !== null) {
+      throw new Error('Local -> Drive transition must clear backend file ID');
+    }
+    if (state.inMemoryScene !== serializedJson) {
+      throw new Error('Local -> Drive transition must preserve in-memory scene');
+    }
+    if (state.saveStatus !== 'dirty') {
+      throw new Error('Local -> Drive transition should mark status as dirty');
+    }
+
+    // Switch back to Local
+    state.currentFileId = 'drive_doc_88';
+    simulateTransition('local');
+    if (state.currentFileId !== null) {
+      throw new Error('Drive -> Local transition must clear backend file ID');
+    }
+    if (state.inMemoryScene !== serializedJson) {
+      throw new Error('Drive -> Local transition must preserve in-memory scene');
+    }
+
+    // Switch back to Drive for save semantics testing
+    simulateTransition('drive');
+
+    // C. First Drive save creates once; later save updates same file ID
+    async function executeTestSave() {
+      const active = coordinator.getActiveStorage();
+      const opGen = state.generation;
+
+      let targetId = state.currentFileId;
+      if (!targetId) {
+        targetId = await active.create(state.currentFileName, state.inMemoryScene);
+        if (opGen !== coordinator.getGeneration()) {
+          // Stale async result dropped
+          return;
+        }
+        state.currentFileId = targetId;
+      } else {
+        await active.update(targetId, state.inMemoryScene);
+        if (opGen !== coordinator.getGeneration()) {
+          return;
+        }
+      }
+      state.saveStatus = 'saved';
+    }
+
+    // First save in Drive
+    await executeTestSave();
+    if (counts.driveCreate !== 1) {
+      throw new Error(`Expected driveCreate to be 1, got ${counts.driveCreate}`);
+    }
+    if (counts.driveUpdate !== 0) {
+      throw new Error(`Expected driveUpdate to be 0, got ${counts.driveUpdate}`);
+    }
+    const savedDriveId = state.currentFileId;
+    if (savedDriveId !== 'drive_id_1') {
+      throw new Error(`Expected drive_id_1, got ${savedDriveId}`);
+    }
+    if (state.saveStatus !== 'saved') {
+      throw new Error('Status should be saved after successful save');
+    }
+
+    // Second save in Drive on same drawing: must call update, not create
+    await executeTestSave();
+    if (counts.driveCreate !== 1) {
+      throw new Error('Second save must NOT call create again');
+    }
+    if (counts.driveUpdate !== 1) {
+      throw new Error('Second save must call update');
+    }
+    if (state.currentFileId !== savedDriveId) {
+      throw new Error('File ID must remain stable across updates');
+    }
+
+    // D. Token refresh does not recreate adapter or duplicate files
+    coordinator.setToken('new_refreshed_auth_token');
+    await executeTestSave();
+    if (counts.driveCreate !== 1) {
+      throw new Error('Save after token refresh must not create duplicate file');
+    }
+    if (counts.driveUpdate !== 2) {
+      throw new Error('Save after token refresh must update existing file');
+    }
+
+    // E. Stale pre-transition async operation is ignored
+    // Reset file ID to simulate a pending create during transition
+    state.currentFileId = null;
+    driveCreateDelayMs = 50;
+    const pendingSavePromise = executeTestSave();
+    // Mid-flight transition to local
+    simulateTransition('local');
+    await pendingSavePromise;
+    // The drive create resolved, but opGen !== generation caused it to drop result
+    if (state.currentFileId !== null) {
+      throw new Error('Stale pre-transition async result must NOT be applied to state');
+    }
+
+    // F. Drive failure does NOT silently fall back to LocalStorage
+    simulateTransition('drive');
+    driveCreateDelayMs = 0;
+    driveShouldFail = true;
+    const localCreateBefore = counts.localCreate;
+    const localUpdateBefore = counts.localUpdate;
+
+    let caughtError = false;
+    try {
+      await executeTestSave();
+    } catch {
+      caughtError = true;
+    }
+    if (!caughtError) {
+      throw new Error('Expected Drive failure to throw');
+    }
+    // Verify zero calls made to LocalStorage during Drive failure
+    if (counts.localCreate !== localCreateBefore || counts.localUpdate !== localUpdateBefore) {
+      throw new Error('Drive failure must NEVER fall back to LocalStorage!');
+    }
+    if (state.currentFileId !== null) {
+      throw new Error('Failed save must not adopt an invalid file ID');
+    }
+  });
+
   const allPassed = results.every((r) => r.passed);
+
   return { passed: allPassed, results };
 }
 

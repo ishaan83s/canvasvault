@@ -1,5 +1,5 @@
-import { useState, useMemo } from 'react';
-import { useAuth } from '../auth/AuthContext';
+import { useState, useMemo, useContext } from 'react';
+import { AuthContext } from '../auth/AuthContext';
 import type { DrawingStorage } from '../storage/types';
 import type { StorageMode, AuthMode } from '../storage/storageMode';
 import { resolveStorageMode } from '../storage/storageMode';
@@ -28,21 +28,22 @@ export interface UseStorageSelectionResult {
  * - Generation increments ONLY for actual backend transitions (local <-> drive).
  */
 export function useStorageSelection(options: UseStorageSelectionOptions = {}): UseStorageSelectionResult {
-  const auth = useAuth();
-  const isAuthenticated = auth.state.status === 'authenticated' && !!auth.state.accessToken;
+  const auth = useContext(AuthContext);
+  const isAuthenticated = auth?.state.status === 'authenticated' && !!auth.state.accessToken;
+  const accessToken = auth?.state.accessToken ?? null;
 
   const [coordinator] = useState(
     () =>
       new StorageCoordinator({
         initialMode: resolveStorageMode(isAuthenticated),
-        initialToken: auth.state.accessToken,
+        initialToken: accessToken,
         localStorage: options.localStorage,
         createDriveAdapter: options.driveAdapterFactory,
       })
   );
 
   // Synchronously update token and handle actual backend transitions
-  coordinator.syncAuthState(isAuthenticated, auth.state.accessToken);
+  coordinator.syncAuthState(isAuthenticated, accessToken);
 
   const tokenRefProxy = useMemo(
     () => ({
