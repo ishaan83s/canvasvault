@@ -1242,10 +1242,11 @@ export async function runPersistenceSelfTests(): Promise<{ passed: boolean; resu
       storageMode: 'local' | 'drive';
       saveStatus: string;
       isSaving: boolean;
+      isDebouncing?: boolean;
     }): boolean {
       return (
         state.storageMode === 'drive' &&
-        (state.isSaving || state.saveStatus === 'dirty' || state.saveStatus === 'error' || state.saveStatus === 'saving')
+        (state.isSaving || state.isDebouncing === true || state.saveStatus === 'dirty' || state.saveStatus === 'error' || state.saveStatus === 'saving')
       );
     }
 
@@ -1289,6 +1290,11 @@ export async function runPersistenceSelfTests(): Promise<{ passed: boolean; resu
       throw new Error('In-flight saving Drive state must require confirmation');
     }
 
+    const debouncingDriveState = { storageMode: 'drive' as const, saveStatus: 'saved', isSaving: false, isDebouncing: true };
+    if (!isUnsafeSignOut(debouncingDriveState)) {
+      throw new Error('Debouncing Drive state must require confirmation');
+    }
+
     // Harness for modal orchestrator interactions
     class OrchestratorHarness {
       public isModalOpen = false;
@@ -1301,8 +1307,8 @@ export async function runPersistenceSelfTests(): Promise<{ passed: boolean; resu
       public activeSavePromise: Promise<boolean> | null = null;
       public cancelledDebouncedSave = false;
 
-      public requestSignOut(mode: 'local' | 'drive', status: string, isSaving: boolean) {
-        if (isUnsafeSignOut({ storageMode: mode, saveStatus: status, isSaving })) {
+      public requestSignOut(mode: 'local' | 'drive', status: string, isSaving: boolean, isDebouncing?: boolean) {
+        if (isUnsafeSignOut({ storageMode: mode, saveStatus: status, isSaving, isDebouncing })) {
           this.isModalOpen = true;
         } else {
           this.signedOutCount++;
@@ -1379,9 +1385,15 @@ export async function runPersistenceSelfTests(): Promise<{ passed: boolean; resu
     // F. Sign Out Without Saving explicitly discards and signs out
     const harness3 = new OrchestratorHarness();
     harness3.requestSignOut('drive', 'dirty', false);
+    let discardedDriveSceneCleared = false;
+    const mockDiscard = async () => {
+      harness3.cancelledDebouncedSave = true;
+      discardedDriveSceneCleared = true;
+    };
+    await mockDiscard();
     harness3.handleSignOutWithoutSaving();
-    if (!harness3.cancelledDebouncedSave || harness3.signedOutCount !== 1 || harness3.isModalOpen) {
-      throw new Error('Sign Out Without Saving must cancel pending saves, close modal, and sign out');
+    if (!harness3.cancelledDebouncedSave || !discardedDriveSceneCleared || harness3.signedOutCount !== 1 || harness3.isModalOpen) {
+      throw new Error('Sign Out Without Saving must cancel pending saves, discard in-memory scene, close modal, and sign out');
     }
 
     // G. Cancel preserves state

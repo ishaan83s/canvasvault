@@ -61,8 +61,12 @@ function MainLayout() {
     };
   }, [isAuthenticated, sessionGen, resolvedSessionGen]);
 
+  const [isSignOutModalOpen, setIsSignOutModalOpen] = useState<boolean>(false);
+  const [signOutSaveError, setSignOutSaveError] = useState<string | null>(null);
+
   const isMigrationModalOpen =
     isAuthenticated &&
+    !isSignOutModalOpen &&
     sessionGen > 0 &&
     sessionGen !== resolvedSessionGen &&
     localDrawingCount > 0;
@@ -80,9 +84,6 @@ function MainLayout() {
       driveStorage: persistence.driveAdapter as unknown as MigrationDriveTarget,
     });
   };
-
-  const [isSignOutModalOpen, setIsSignOutModalOpen] = useState<boolean>(false);
-  const [signOutSaveError, setSignOutSaveError] = useState<string | null>(null);
 
   const handleCloseMigration = () => {
     setResolvedSessionGen(sessionGen);
@@ -129,7 +130,7 @@ function MainLayout() {
   };
 
   const handleSignOutWithoutSaving = async () => {
-    persistence.cancelPendingSave();
+    await persistence.discardUnsavedDriveChanges();
     setIsSignOutModalOpen(false);
     setSignOutSaveError(null);
     auth.signOut();

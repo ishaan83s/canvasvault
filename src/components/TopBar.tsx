@@ -13,7 +13,7 @@ interface TopBarProps {
   onSave: () => void;
   onNew: () => void;
   onRename: (newName: string) => void;
-  onSignOutRequest?: () => void;
+  onSignOutRequest: () => void;
 }
 
 export const TopBar: React.FC<TopBarProps> = ({

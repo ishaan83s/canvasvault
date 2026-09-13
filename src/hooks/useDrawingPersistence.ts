@@ -144,7 +144,7 @@ export function useDrawingPersistence({
     return savePromise;
   }, [api, currentFileName, storage, storageMode, refreshFiles]);
 
-  const { trigger: triggerDebouncedSave, cancel: cancelDebouncedSave } = useDebouncedSave({
+  const { trigger: triggerDebouncedSave, cancel: cancelDebouncedSave, isDebouncing } = useDebouncedSave({
     delayMs: 1500,
     onSave: async () => {
       await executeSave();
@@ -354,20 +354,98 @@ export function useDrawingPersistence({
     [storage, refreshFiles, openDrawing, createNewDrawing]
   );
 
+  const discardUnsavedDriveChanges = useCallback(async () => {
+    cancelDebouncedSave();
+    if (!api) return;
+
+    try {
+      const localList = await selection.localStorage.list();
+      const lastOpenedId = localStorage.getItem(LAST_OPENED_KEY);
+      const targetFile = localList.find((f) => f.id === lastOpenedId) || localList[0];
+
+      if (targetFile) {
+        const rawContent = await selection.localStorage.get(targetFile.id);
+        const restored = deserializeDrawing(rawContent);
+
+        isInitializingRef.current = true;
+        api.resetScene();
+        api.updateScene({
+          elements: restored.elements,
+          appState: {
+            ...restored.appState,
+            collaborators: new Map(),
+          },
+          captureUpdate: CaptureUpdateAction.NEVER,
+        });
+
+        if (restored.files && Object.keys(restored.files).length > 0) {
+          api.addFiles(Object.values(restored.files));
+        }
+
+        api.history.clear();
+        isInitializingRef.current = false;
+
+        currentFileIdRef.current = targetFile.id;
+        setCurrentFileId(targetFile.id);
+        setCurrentFileName(stripExcalidrawExtension(targetFile.name));
+        lastSavedContentRef.current = rawContent;
+        lastSceneVersionRef.current = getSceneVersion(restored.elements);
+        setSaveStatus('saved');
+        return;
+      }
+    } catch (err) {
+      console.warn('Failed to restore local drawing on discard:', err);
+    }
+
+    isInitializingRef.current = true;
+    api.resetScene();
+    api.history.clear();
+    isInitializingRef.current = false;
+
+    currentFileIdRef.current = null;
+    setCurrentFileId(null);
+    setCurrentFileName('Untitled');
+    lastSavedContentRef.current = '';
+    lastSceneVersionRef.current = 0;
+    setSaveStatus('saved');
+  }, [api, cancelDebouncedSave, selection.localStorage]);
+
   // Storage transition handler: local <-> drive
   useEffect(() => {
     if (previousModeRef.current === storageMode) {
       return;
     }
 
-    // Backend transition detected:
-    // Update refs and invalidate pending async operations from old storage
+    const prevMode = previousModeRef.current;
     previousModeRef.current = storageMode;
     storageGenerationRef.current = generation;
 
     // 1. Invalidate pending debounced saves
     cancelDebouncedSave();
 
+    if (prevMode === 'drive' && storageMode === 'local') {
+      // Transition from Drive to Local (sign-out):
+      // Cleanly restore LocalStorage workspace so Drive content cannot leak into LocalStorage
+      (async () => {
+        try {
+          const localList = await refreshFiles();
+          if (storageGenerationRef.current !== generation) return;
+
+          const lastOpenedId = localStorage.getItem(LAST_OPENED_KEY);
+          const targetFile = localList.find((f) => f.id === lastOpenedId) || localList[0];
+          if (targetFile) {
+            await openDrawing(targetFile.id);
+          } else {
+            await createNewDrawing('My First Drawing');
+          }
+        } catch (err) {
+          console.warn('Failed to restore local workspace on sign-out transition:', err);
+        }
+      })();
+      return;
+    }
+
+    // Transition from Local to Drive (sign-in):
     // 2. Clear backend file ID (local IDs are not Drive IDs, and vice versa)
     currentFileIdRef.current = null;
     setCurrentFileId(null);
@@ -379,7 +457,7 @@ export function useDrawingPersistence({
 
     // 4. Populate sidebar with drawings from the new active backend
     refreshFiles();
-  }, [storageMode, generation, cancelDebouncedSave, refreshFiles]);
+  }, [storageMode, generation, cancelDebouncedSave, refreshFiles, openDrawing, createNewDrawing]);
 
   // Initial load when API is mounted for the first time
   useEffect(() => {
@@ -422,7 +500,7 @@ export function useDrawingPersistence({
     isSaving,
     isSignOutSafe:
       storageMode !== 'drive' ||
-      (!isSaving && saveStatus !== 'dirty' && saveStatus !== 'error' && saveStatus !== 'saving'),
+      (!isSaving && !isDebouncing && saveStatus !== 'dirty' && saveStatus !== 'error' && saveStatus !== 'saving'),
     lastSavedAt,
     errorMessage,
     isLoading,
@@ -432,6 +510,7 @@ export function useDrawingPersistence({
     driveAdapter: selection.driveAdapter,
     saveNow,
     cancelPendingSave: cancelDebouncedSave,
+    discardUnsavedDriveChanges,
     handleCanvasChange,
     openDrawing,
     createNewDrawing,

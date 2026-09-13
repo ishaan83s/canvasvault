@@ -1,4 +1,4 @@
-import { useEffect, useRef, useCallback } from 'react';
+import { useEffect, useRef, useCallback, useState } from 'react';
 
 interface UseDebouncedSaveOptions {
   delayMs?: number;
@@ -8,6 +8,7 @@ interface UseDebouncedSaveOptions {
 export function useDebouncedSave({ delayMs = 1500, onSave }: UseDebouncedSaveOptions) {
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const onSaveRef = useRef(onSave);
+  const [isDebouncing, setIsDebouncing] = useState<boolean>(false);
 
   useEffect(() => {
     onSaveRef.current = onSave;
@@ -17,13 +18,16 @@ export function useDebouncedSave({ delayMs = 1500, onSave }: UseDebouncedSaveOpt
     if (timeoutRef.current !== null) {
       clearTimeout(timeoutRef.current);
       timeoutRef.current = null;
+      setIsDebouncing(false);
     }
   }, []);
 
   const trigger = useCallback(() => {
     cancel();
+    setIsDebouncing(true);
     timeoutRef.current = setTimeout(async () => {
       timeoutRef.current = null;
+      setIsDebouncing(false);
       await onSaveRef.current();
     }, delayMs);
   }, [cancel, delayMs]);
@@ -34,5 +38,5 @@ export function useDebouncedSave({ delayMs = 1500, onSave }: UseDebouncedSaveOpt
     };
   }, [cancel]);
 
-  return { trigger, cancel };
+  return { trigger, cancel, isDebouncing };
 }

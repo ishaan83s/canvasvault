@@ -2,11 +2,11 @@ import React, { useState } from 'react';
 import { useAuth } from '../auth/AuthContext';
 
 export interface GoogleSignInButtonProps {
-  onSignOutRequest?: () => void;
+  onSignOutRequest: () => void;
 }
 
 export const GoogleSignInButton: React.FC<GoogleSignInButtonProps> = ({ onSignOutRequest }) => {
-  const { state, signIn, signOut, isConfigured } = useAuth();
+  const { state, signIn, isConfigured } = useAuth();
   const [showConfigHelp, setShowConfigHelp] = useState(false);
 
   const handleSignInClick = () => {
@@ -50,13 +50,7 @@ export const GoogleSignInButton: React.FC<GoogleSignInButtonProps> = ({ onSignOu
         </span>
 
         <button
-          onClick={() => {
-            if (onSignOutRequest) {
-              onSignOutRequest();
-            } else {
-              signOut();
-            }
-          }}
+          onClick={onSignOutRequest}
           title="Sign out of Google"
           style={{
             fontSize: '11px',

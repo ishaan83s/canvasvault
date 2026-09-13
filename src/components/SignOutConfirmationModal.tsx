@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { sanitizeErrorMessage } from '../storage/googleDriveErrors';
 
 export interface SignOutConfirmationModalProps {
   isOpen: boolean;
@@ -55,7 +56,8 @@ export const SignOutConfirmationModal: React.FC<SignOutConfirmationModalProps> =
     }
   };
 
-  const displayedError = localError || saveErrorMessage;
+  const rawError = localError || saveErrorMessage;
+  const displayedError = rawError ? sanitizeErrorMessage(rawError) : null;
 
   return (
     <div
