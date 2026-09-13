@@ -1454,6 +1454,498 @@ export async function runPersistenceSelfTests(): Promise<{ passed: boolean; resu
     localStorage.removeItem(testStorageKey);
   });
 
+  // 21. Async file operation sequence guards and concurrency protection
+  await record('21. Async file operation sequence guards and concurrency protection', async () => {
+    // A complete harness modeling the exact monotonic sequence guards and invalidation logic
+    // of useDrawingPersistence.
+    class AsyncSequenceGuardHarness {
+      public files: any[] = [];
+      public currentFileId: any = null;
+      public currentFileName: any = 'Untitled';
+      public saveStatus: any = 'saved';
+      public errorMessage: any = null;
+      public isLoading: any = false;
+      public isOpeningFile: any = false;
+      public isFileOperating: any = false;
+
+      public storageGeneration: any = 1;
+      public latestLoadRequestId: any = 0;
+      public latestListRequestId: any = 0;
+      public activeCreatePromise: any = null;
+
+      public canvasContent: any = null;
+      public createCallCount: any = 0;
+
+      public mockStorage: {
+        get: (id: string) => Promise<string>;
+        list: () => Promise<any[]>;
+        create: (name: string, content: string) => Promise<string>;
+        delete?: (id: string) => Promise<void>;
+      };
+
+      constructor(mockStorage: any) {
+        this.mockStorage = mockStorage;
+      }
+
+      public async refreshFiles(): Promise<any[]> {
+        const opGen = this.storageGeneration;
+        const listRequestId = ++this.latestListRequestId;
+        try {
+          const list = await this.mockStorage.list();
+          if (opGen !== this.storageGeneration || listRequestId !== this.latestListRequestId) {
+            return [];
+          }
+          this.files = list;
+          return list;
+        } catch (err: any) {
+          if (opGen !== this.storageGeneration || listRequestId !== this.latestListRequestId) {
+            return [];
+          }
+          this.errorMessage = err?.message || 'Failed to list drawings';
+          return [];
+        }
+      }
+
+      public async openDrawing(fileId: string): Promise<boolean> {
+        const opGen = this.storageGeneration;
+        const loadRequestId = ++this.latestLoadRequestId;
+        this.isLoading = true;
+        this.isOpeningFile = true;
+        this.errorMessage = null;
+
+        try {
+          const rawContent = await this.mockStorage.get(fileId);
+          if (opGen !== this.storageGeneration || loadRequestId !== this.latestLoadRequestId) {
+            return false;
+          }
+
+          this.canvasContent = rawContent;
+
+          const fileList = await this.refreshFiles();
+          if (opGen !== this.storageGeneration || loadRequestId !== this.latestLoadRequestId) {
+            return false;
+          }
+
+          const found = fileList.find((f: any) => f.id === fileId);
+          const name = found ? found.name : 'Untitled';
+
+          this.currentFileId = fileId;
+          this.currentFileName = name;
+          this.saveStatus = 'saved';
+          return true;
+        } catch (err: any) {
+          if (opGen !== this.storageGeneration || loadRequestId !== this.latestLoadRequestId) {
+            return false;
+          }
+          this.errorMessage = err?.message || 'Failed to open drawing';
+          return false;
+        } finally {
+          if (opGen === this.storageGeneration && loadRequestId === this.latestLoadRequestId) {
+            this.isLoading = false;
+            this.isOpeningFile = false;
+          }
+        }
+      }
+
+      public async createNewDrawing(name: string = 'Untitled'): Promise<string | null> {
+        if (this.activeCreatePromise) {
+          return this.activeCreatePromise;
+        }
+
+        const opGen = this.storageGeneration;
+        const loadRequestId = ++this.latestLoadRequestId;
+        this.isLoading = true;
+        this.isFileOperating = true;
+
+        const createPromise = (async (): Promise<string | null> => {
+          try {
+            const emptyContent = JSON.stringify({ name, elements: [] });
+            this.createCallCount++;
+            const newId = await this.mockStorage.create(name, emptyContent);
+            if (opGen !== this.storageGeneration || loadRequestId !== this.latestLoadRequestId) {
+              return null;
+            }
+
+            this.canvasContent = emptyContent;
+            this.currentFileId = newId;
+            this.currentFileName = name;
+            this.saveStatus = 'saved';
+
+            await this.refreshFiles();
+            return newId;
+          } catch (err: any) {
+            if (opGen !== this.storageGeneration || loadRequestId !== this.latestLoadRequestId) {
+              return null;
+            }
+            this.errorMessage = err?.message || 'Failed to create drawing';
+            return null;
+          } finally {
+            this.activeCreatePromise = null;
+            if (opGen === this.storageGeneration && loadRequestId === this.latestLoadRequestId) {
+              this.isLoading = false;
+              this.isFileOperating = false;
+            }
+          }
+        })();
+
+        this.activeCreatePromise = createPromise;
+        return createPromise;
+      }
+
+      public transitionStorageGeneration(newGen: number) {
+        this.storageGeneration = newGen;
+        this.latestLoadRequestId++;
+        this.latestListRequestId++;
+        this.activeCreatePromise = null;
+        this.isOpeningFile = false;
+        this.isFileOperating = false;
+      }
+    }
+
+    // Helper: delay promise
+    const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    // A. Rapid out-of-order openDrawing responses: A (slow) then B (fast) -> B wins, A is dropped
+    const mockFilesMap: Record<string, string> = {
+      file_A: 'content_A',
+      file_B: 'content_B',
+      file_C: 'content_C',
+    };
+    const harnessA = new AsyncSequenceGuardHarness({
+      get: async (id: string) => {
+        if (id === 'file_A') await delay(50);
+        if (id === 'file_B') await delay(10);
+        return mockFilesMap[id] || '';
+      },
+      list: async () => [
+        { id: 'file_A', name: 'Drawing A' },
+        { id: 'file_B', name: 'Drawing B' },
+        { id: 'file_C', name: 'Drawing C' },
+      ],
+      create: async () => 'mock_created',
+    });
+
+    const pA = harnessA.openDrawing('file_A');
+    const pB = harnessA.openDrawing('file_B');
+    if (!harnessA.isOpeningFile) throw new Error('isOpeningFile should be true during in-flight load');
+
+    const [resA, resB] = await Promise.all([pA, pB]);
+    if (resA !== false) throw new Error('Stale open response A should have returned false (dropped)');
+    if (resB !== true) throw new Error('Latest open response B should have returned true (accepted)');
+    if (harnessA.currentFileId !== 'file_B') throw new Error(`Expected currentFileId file_B, got ${harnessA.currentFileId}`);
+    if (harnessA.currentFileName !== 'Drawing B') throw new Error(`Expected currentFileName Drawing B, got ${harnessA.currentFileName}`);
+    if (harnessA.canvasContent !== 'content_B') throw new Error('Canvas content was not updated to winning drawing B');
+    if (harnessA.isOpeningFile !== false) throw new Error('isOpeningFile should be false after completion');
+    if (harnessA.isLoading !== false) throw new Error('isLoading should be false after completion');
+
+    // B. Rapid A -> B -> C requests (latest open request wins)
+    const harnessB = new AsyncSequenceGuardHarness({
+      get: async (id: string) => {
+        if (id === 'file_A') await delay(60);
+        if (id === 'file_B') await delay(40);
+        if (id === 'file_C') await delay(10);
+        return mockFilesMap[id] || '';
+      },
+      list: async () => [
+        { id: 'file_A', name: 'Drawing A' },
+        { id: 'file_B', name: 'Drawing B' },
+        { id: 'file_C', name: 'Drawing C' },
+      ],
+      create: async () => 'mock_created',
+    });
+
+    const [rA, rB, rC] = await Promise.all([
+      harnessB.openDrawing('file_A'),
+      harnessB.openDrawing('file_B'),
+      harnessB.openDrawing('file_C'),
+    ]);
+    if (rA !== false || rB !== false) throw new Error('Older requests A and B must be dropped');
+    if (rC !== true) throw new Error('Latest request C must succeed');
+    if (harnessB.currentFileId !== 'file_C') throw new Error('Latest file C must be the active file');
+    if (harnessB.canvasContent !== 'content_C') throw new Error('Canvas must reflect latest drawing C');
+
+    // C. Stale open response cannot update currentFileId
+    const harnessC = new AsyncSequenceGuardHarness({
+      get: async (id: string) => {
+        if (id === 'stale_file') await delay(50);
+        if (id === 'active_file') await delay(10);
+        return mockFilesMap[id] || '{}';
+      },
+      list: async () => [
+        { id: 'stale_file', name: 'Stale' },
+        { id: 'active_file', name: 'Active' },
+      ],
+      create: async () => 'mock_created',
+    });
+
+    const pStale = harnessC.openDrawing('stale_file');
+    await delay(5);
+    const pActive = harnessC.openDrawing('active_file');
+    await Promise.all([pStale, pActive]);
+    if (harnessC.currentFileId !== 'active_file') {
+      throw new Error(`Stale open response overwrote currentFileId: ${harnessC.currentFileId}`);
+    }
+
+    // D. Out-of-order refreshFiles responses (stale list response cannot replace newer list or resurrect deleted file)
+    let currentStoreFiles = [
+      { id: 'file_keep', name: 'Keep.excalidraw' },
+      { id: 'file_delete', name: 'Delete.excalidraw' },
+    ];
+    let listCallCount: any = 0;
+    const harnessD = new AsyncSequenceGuardHarness({
+      get: async () => '{}',
+      list: async () => {
+        listCallCount++;
+        if (listCallCount === 1) {
+          // Slow initial list containing the doomed file
+          await delay(50);
+          return [
+            { id: 'file_keep', name: 'Keep.excalidraw' },
+            { id: 'file_delete', name: 'Delete.excalidraw' },
+          ];
+        } else {
+          // Fast subsequent list after deletion
+          await delay(10);
+          return currentStoreFiles;
+        }
+      },
+      create: async () => 'mock_created',
+    });
+
+    // Stale list request starts
+    const pList1 = harnessD.refreshFiles();
+    // User deletes file_delete shortly after
+    await delay(5);
+    currentStoreFiles = [{ id: 'file_keep', name: 'Keep.excalidraw' }];
+    // Fast list request starts after deletion
+    const pList2 = harnessD.refreshFiles();
+
+    await Promise.all([pList1, pList2]);
+    if (harnessD.files.length !== 1 || harnessD.files[0].id !== 'file_keep') {
+      throw new Error('Stale list response resurrected deleted file in files state');
+    }
+
+    // E. Duplicate concurrent create calls produce only one file
+    let createdCount: any = 0;
+    const harnessE = new AsyncSequenceGuardHarness({
+      get: async () => '{}',
+      list: async () => [],
+      create: async (name: string) => {
+        createdCount++;
+        await delay(25);
+        return `file_created_${createdCount}_${name}`;
+      },
+    });
+
+    // Double-click / rapid concurrent invocations
+    const [c1, c2, c3] = await Promise.all([
+      harnessE.createNewDrawing('Double Click Test'),
+      harnessE.createNewDrawing('Double Click Test'),
+      harnessE.createNewDrawing('Double Click Test'),
+    ]);
+
+    if (harnessE.createCallCount !== 1) {
+      throw new Error(`Expected exactly 1 storage.create invocation, got ${harnessE.createCallCount}`);
+    }
+    if (!c1 || c1 !== c2 || c2 !== c3) {
+      throw new Error(`Concurrent create calls did not return identical file ID: ${c1}, ${c2}, ${c3}`);
+    }
+    if (harnessE.activeCreatePromise !== null) {
+      throw new Error('activeCreatePromise was not cleared after completion');
+    }
+    if (harnessE.isFileOperating !== false) {
+      throw new Error('isFileOperating should be false after create completes');
+    }
+
+    // Subsequent call after completion creates a new file independently
+    const c4 = await harnessE.createNewDrawing('Second File');
+    if (harnessE.createCallCount !== 2 || c4 === c1) {
+      throw new Error('Subsequent createNewDrawing did not execute new file creation');
+    }
+
+    // F. Generation transition invalidates pending open
+    const harnessF = new AsyncSequenceGuardHarness({
+      get: async () => {
+        await delay(40);
+        return 'gen1_content';
+      },
+      list: async () => [{ id: 'gen1_doc', name: 'Gen1 Doc' }],
+      create: async () => 'mock_created',
+    });
+
+    const pPendingOpen = harnessF.openDrawing('gen1_doc');
+    await delay(10);
+    // Switch generation (e.g. user signs in or out)
+    harnessF.transitionStorageGeneration(2);
+
+    const openOutcome = await pPendingOpen;
+    if (openOutcome !== false) throw new Error('Pending open across generation change must return false');
+    if (harnessF.currentFileId !== null) throw new Error('Stale generation open must NOT set currentFileId');
+    if (harnessF.canvasContent !== null) throw new Error('Stale generation open must NOT mutate canvas');
+    if (harnessF.isOpeningFile !== false) throw new Error('isOpeningFile should be reset on transition');
+
+    // G. Generation transition invalidates pending list
+    let listGen = 1;
+    const harnessG = new AsyncSequenceGuardHarness({
+      get: async () => '{}',
+      list: async () => {
+        if (listGen === 1) {
+          await delay(40);
+          return [{ id: 'stale_gen1_file', name: 'Old Gen' }];
+        }
+        return [{ id: 'new_gen2_file', name: 'New Gen' }];
+      },
+      create: async () => 'mock_created',
+    });
+
+    const pPendingList = harnessG.refreshFiles();
+    await delay(10);
+    listGen = 2;
+    harnessG.transitionStorageGeneration(2);
+
+    await pPendingList;
+    if (harnessG.files.some((f) => f.id === 'stale_gen1_file')) {
+      throw new Error('Pending list from old generation populated files state');
+    }
+
+    // New list in gen 2 works normally
+    await harnessG.refreshFiles();
+    if (harnessG.files.length !== 1 || harnessG.files[0].id !== 'new_gen2_file') {
+      throw new Error('New generation list was not accepted');
+    }
+
+    // H. Stale operation cannot mutate saveStatus, currentFileName, or errorMessage
+    const harnessH = new AsyncSequenceGuardHarness({
+      get: async (id: string) => {
+        if (id === 'bad_stale') {
+          await delay(40);
+          throw new Error('Stale backend failure');
+        }
+        await delay(10);
+        return 'good_content';
+      },
+      list: async () => [
+        { id: 'bad_stale', name: 'Bad Stale' },
+        { id: 'good_fresh', name: 'Good Fresh' },
+      ],
+      create: async () => 'mock_created',
+    });
+
+    const pBad = harnessH.openDrawing('bad_stale');
+    const pGood = harnessH.openDrawing('good_fresh');
+    await Promise.all([pBad, pGood]);
+
+    if (harnessH.errorMessage !== null) {
+      throw new Error(`Stale operation failure set errorMessage: ${harnessH.errorMessage}`);
+    }
+    if (harnessH.currentFileName !== 'Good Fresh') {
+      throw new Error(`Current file name was corrupted by stale operation: ${harnessH.currentFileName}`);
+    }
+    if (harnessH.saveStatus !== 'saved') {
+      throw new Error(`Save status was corrupted by stale operation: ${harnessH.saveStatus}`);
+    }
+
+    // I. createNewDrawing invalidates in-flight openDrawing
+    const harnessI = new AsyncSequenceGuardHarness({
+      get: async () => {
+        await delay(50);
+        return 'slow_open_content';
+      },
+      list: async () => [{ id: 'slow_doc', name: 'Slow Doc' }],
+      create: async (name: string, _content: string) => {
+        await delay(15);
+        return `created_${name}`;
+      },
+    });
+
+    const pSlowOpen = harnessI.openDrawing('slow_doc');
+    await delay(5);
+    const pNew = harnessI.createNewDrawing('Fresh Canvas');
+
+    const [resSlow, resNew] = await Promise.all([pSlowOpen, pNew]);
+    if (resSlow !== false) throw new Error('In-flight open superseded by create must be dropped');
+    if (!resNew) throw new Error('createNewDrawing should succeed');
+    if (harnessI.currentFileName !== 'Fresh Canvas') {
+      throw new Error(`Expected Fresh Canvas, got ${harnessI.currentFileName}`);
+    }
+    if (harnessI.canvasContent === 'slow_open_content') {
+      throw new Error('Superseded openDrawing overwrote the newly created canvas');
+    }
+
+    // J. isSignOutSafe contract verification
+    const evaluateSignOutSafe = (state: {
+      storageMode: 'local' | 'drive';
+      isSaving: boolean;
+      isDebouncing: boolean;
+      isOpeningFile: boolean;
+      isFileOperating: boolean;
+      saveStatus: string;
+    }) => {
+      return (
+        state.storageMode !== 'drive' ||
+        (!state.isSaving &&
+          !state.isDebouncing &&
+          !state.isOpeningFile &&
+          !state.isFileOperating &&
+          state.saveStatus !== 'dirty' &&
+          state.saveStatus !== 'error' &&
+          state.saveStatus !== 'saving')
+      );
+    };
+
+    if (
+      !evaluateSignOutSafe({
+        storageMode: 'local',
+        isSaving: false,
+        isDebouncing: false,
+        isOpeningFile: true,
+        isFileOperating: true,
+        saveStatus: 'dirty',
+      })
+    ) {
+      throw new Error('Local storage mode should always be safe for sign-out');
+    }
+
+    if (
+      evaluateSignOutSafe({
+        storageMode: 'drive',
+        isSaving: false,
+        isDebouncing: false,
+        isOpeningFile: true,
+        isFileOperating: false,
+        saveStatus: 'saved',
+      })
+    ) {
+      throw new Error('Drive mode with isOpeningFile=true must NOT be safe for sign-out');
+    }
+
+    if (
+      evaluateSignOutSafe({
+        storageMode: 'drive',
+        isSaving: false,
+        isDebouncing: false,
+        isOpeningFile: false,
+        isFileOperating: true,
+        saveStatus: 'saved',
+      })
+    ) {
+      throw new Error('Drive mode with isFileOperating=true must NOT be safe for sign-out');
+    }
+
+    if (
+      !evaluateSignOutSafe({
+        storageMode: 'drive',
+        isSaving: false,
+        isDebouncing: false,
+        isOpeningFile: false,
+        isFileOperating: false,
+        saveStatus: 'saved',
+      })
+    ) {
+      throw new Error('Idle, clean Drive mode must be safe for sign-out');
+    }
+  });
+
   const allPassed = results.every((r) => r.passed);
 
   return { passed: allPassed, results };

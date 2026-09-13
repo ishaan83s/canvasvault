@@ -39,10 +39,17 @@ export function useDrawingPersistence({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isSaving, setIsSaving] = useState<boolean>(false);
+  const [isOpeningFile, setIsOpeningFile] = useState<boolean>(false);
+  const [isFileOperating, setIsFileOperating] = useState<boolean>(false);
 
   // Generation guard to prevent stale async operations from mutating state
   const storageGenerationRef = useRef<number>(generation);
   const previousModeRef = useRef<StorageMode>(storageMode);
+
+  // Monotonic sequence guards to drop stale out-of-order async operations
+  const latestLoadRequestIdRef = useRef<number>(0);
+  const latestListRequestIdRef = useRef<number>(0);
+  const activeCreatePromiseRef = useRef<Promise<string | null> | null>(null);
 
   // Synchronous tracking of current active file ID to prevent duplicate file creations
   const currentFileIdRef = useRef<string | null>(null);
@@ -54,18 +61,19 @@ export function useDrawingPersistence({
   const lastSceneVersionRef = useRef<number>(0);
   const isInitializingRef = useRef<boolean>(true);
 
-  // Refresh files scoped to current storage and generation
+  // Refresh files scoped to current storage, generation, and list request sequence
   const refreshFiles = useCallback(async () => {
     const opGen = storageGenerationRef.current;
+    const listRequestId = ++latestListRequestIdRef.current;
     try {
       const list = await storage.list();
-      if (opGen !== storageGenerationRef.current) {
+      if (opGen !== storageGenerationRef.current || listRequestId !== latestListRequestIdRef.current) {
         return [];
       }
       setFiles(list);
       return list;
     } catch (err) {
-      if (opGen !== storageGenerationRef.current) {
+      if (opGen !== storageGenerationRef.current || listRequestId !== latestListRequestIdRef.current) {
         return [];
       }
       console.error('Failed to list files:', err);
@@ -170,19 +178,21 @@ export function useDrawingPersistence({
     [api, triggerDebouncedSave]
   );
 
-  // Open a specific drawing
+  // Open a specific drawing with monotonic sequence tracking
   const openDrawing = useCallback(
     async (fileId: string) => {
       if (!api) return;
 
       cancelDebouncedSave();
       const opGen = storageGenerationRef.current;
+      const loadRequestId = ++latestLoadRequestIdRef.current;
       setIsLoading(true);
+      setIsOpeningFile(true);
       setErrorMessage(null);
 
       try {
         const rawContent = await storage.get(fileId);
-        if (opGen !== storageGenerationRef.current) {
+        if (opGen !== storageGenerationRef.current || loadRequestId !== latestLoadRequestIdRef.current) {
           return;
         }
 
@@ -210,7 +220,7 @@ export function useDrawingPersistence({
         lastSceneVersionRef.current = getSceneVersion(restored.elements);
 
         const fileList = await refreshFiles();
-        if (opGen !== storageGenerationRef.current) {
+        if (opGen !== storageGenerationRef.current || loadRequestId !== latestLoadRequestIdRef.current) {
           return;
         }
 
@@ -227,14 +237,15 @@ export function useDrawingPersistence({
           localStorage.setItem(LAST_OPENED_KEY, fileId);
         }
       } catch (err) {
-        if (opGen !== storageGenerationRef.current) {
+        if (opGen !== storageGenerationRef.current || loadRequestId !== latestLoadRequestIdRef.current) {
           return;
         }
         console.error('Failed to open drawing:', err);
         setErrorMessage(err instanceof Error ? err.message : 'Failed to open drawing');
       } finally {
-        if (opGen === storageGenerationRef.current) {
+        if (opGen === storageGenerationRef.current && loadRequestId === latestLoadRequestIdRef.current) {
           setIsLoading(false);
+          setIsOpeningFile(false);
           setTimeout(() => {
             isInitializingRef.current = false;
           }, 100);
@@ -244,62 +255,77 @@ export function useDrawingPersistence({
     [api, cancelDebouncedSave, storage, storageMode, refreshFiles]
   );
 
-  // Create a new blank drawing
+  // Create a new blank drawing with concurrency deduplication
   const createNewDrawing = useCallback(
-    async (name: string = 'Untitled') => {
-      if (!api) return;
+    async (name: string = 'Untitled'): Promise<string | null> => {
+      if (!api) return null;
+      if (activeCreatePromiseRef.current) {
+        return activeCreatePromiseRef.current;
+      }
 
       cancelDebouncedSave();
       const opGen = storageGenerationRef.current;
+      const loadRequestId = ++latestLoadRequestIdRef.current;
       setIsLoading(true);
+      setIsFileOperating(true);
 
-      try {
-        const emptyContent = createEmptyDrawing(name);
-        const newId = await storage.create(name, emptyContent);
-        if (opGen !== storageGenerationRef.current) {
-          return;
+      const createPromise = (async (): Promise<string | null> => {
+        try {
+          const emptyContent = createEmptyDrawing(name);
+          const newId = await storage.create(name, emptyContent);
+          if (opGen !== storageGenerationRef.current || loadRequestId !== latestLoadRequestIdRef.current) {
+            return null;
+          }
+
+          isInitializingRef.current = true;
+          api.resetScene();
+          api.history.clear();
+
+          lastSavedContentRef.current = emptyContent;
+          lastSceneVersionRef.current = 0;
+
+          currentFileIdRef.current = newId;
+          setCurrentFileId(newId);
+          setCurrentFileName(name);
+          setSaveStatus('saved');
+          setLastSavedAt(new Date());
+
+          if (storageMode === 'local') {
+            localStorage.setItem(LAST_OPENED_KEY, newId);
+          }
+
+          await refreshFiles();
+          return newId;
+        } catch (err) {
+          if (opGen !== storageGenerationRef.current || loadRequestId !== latestLoadRequestIdRef.current) {
+            return null;
+          }
+          console.error('Failed to create new drawing:', err);
+          setErrorMessage(err instanceof Error ? err.message : 'Failed to create drawing');
+          return null;
+        } finally {
+          activeCreatePromiseRef.current = null;
+          if (opGen === storageGenerationRef.current && loadRequestId === latestLoadRequestIdRef.current) {
+            setIsLoading(false);
+            setIsFileOperating(false);
+            setTimeout(() => {
+              isInitializingRef.current = false;
+            }, 100);
+          }
         }
+      })();
 
-        isInitializingRef.current = true;
-        api.resetScene();
-        api.history.clear();
-
-        lastSavedContentRef.current = emptyContent;
-        lastSceneVersionRef.current = 0;
-
-        currentFileIdRef.current = newId;
-        setCurrentFileId(newId);
-        setCurrentFileName(name);
-        setSaveStatus('saved');
-        setLastSavedAt(new Date());
-
-        if (storageMode === 'local') {
-          localStorage.setItem(LAST_OPENED_KEY, newId);
-        }
-
-        await refreshFiles();
-      } catch (err) {
-        if (opGen !== storageGenerationRef.current) {
-          return;
-        }
-        console.error('Failed to create new drawing:', err);
-        setErrorMessage(err instanceof Error ? err.message : 'Failed to create drawing');
-      } finally {
-        if (opGen === storageGenerationRef.current) {
-          setIsLoading(false);
-          setTimeout(() => {
-            isInitializingRef.current = false;
-          }, 100);
-        }
-      }
+      activeCreatePromiseRef.current = createPromise;
+      return createPromise;
     },
     [api, cancelDebouncedSave, storage, storageMode, refreshFiles]
   );
 
-  // Rename drawing
+  // Rename drawing with operation status tracking
   const renameDrawing = useCallback(
     async (fileId: string, newName: string) => {
       const opGen = storageGenerationRef.current;
+      setIsFileOperating(true);
       try {
         await storage.rename(fileId, newName);
         if (opGen !== storageGenerationRef.current) {
@@ -316,15 +342,21 @@ export function useDrawingPersistence({
         }
         console.error('Failed to rename drawing:', err);
         setErrorMessage(err instanceof Error ? err.message : 'Failed to rename drawing');
+      } finally {
+        if (opGen === storageGenerationRef.current) {
+          setIsFileOperating(false);
+        }
       }
     },
     [storage, refreshFiles]
   );
 
-  // Delete drawing
+  // Delete drawing with operation status tracking and debounce cancellation
   const deleteDrawing = useCallback(
     async (fileId: string) => {
+      cancelDebouncedSave();
       const opGen = storageGenerationRef.current;
+      setIsFileOperating(true);
       try {
         await storage.delete(fileId);
         if (opGen !== storageGenerationRef.current) {
@@ -349,9 +381,13 @@ export function useDrawingPersistence({
         }
         console.error('Failed to delete drawing:', err);
         setErrorMessage(err instanceof Error ? err.message : 'Failed to delete drawing');
+      } finally {
+        if (opGen === storageGenerationRef.current) {
+          setIsFileOperating(false);
+        }
       }
     },
-    [storage, refreshFiles, openDrawing, createNewDrawing]
+    [storage, refreshFiles, openDrawing, createNewDrawing, cancelDebouncedSave]
   );
 
   const discardUnsavedDriveChanges = useCallback(async () => {
@@ -423,6 +459,13 @@ export function useDrawingPersistence({
     // 1. Invalidate pending debounced saves
     cancelDebouncedSave();
 
+    // 2. Invalidate any in-flight load requests or create requests from previous mode
+    latestLoadRequestIdRef.current++;
+    latestListRequestIdRef.current++;
+    activeCreatePromiseRef.current = null;
+    setIsOpeningFile(false);
+    setIsFileOperating(false);
+
     if (prevMode === 'drive' && storageMode === 'local') {
       // Transition from Drive to Local (sign-out):
       // Cleanly restore LocalStorage workspace so Drive content cannot leak into LocalStorage
@@ -446,16 +489,16 @@ export function useDrawingPersistence({
     }
 
     // Transition from Local to Drive (sign-in):
-    // 2. Clear backend file ID (local IDs are not Drive IDs, and vice versa)
+    // 3. Clear backend file ID (local IDs are not Drive IDs, and vice versa)
     currentFileIdRef.current = null;
     setCurrentFileId(null);
 
-    // 3. Mark current scene as transient/unsaved in the newly active storage.
+    // 4. Mark current scene as transient/unsaved in the newly active storage.
     // The current in-memory scene is preserved without overwriting!
     lastSavedContentRef.current = '';
     setSaveStatus('dirty');
 
-    // 4. Populate sidebar with drawings from the new active backend
+    // 5. Populate sidebar with drawings from the new active backend
     refreshFiles();
   }, [storageMode, generation, cancelDebouncedSave, refreshFiles, openDrawing, createNewDrawing]);
 
@@ -498,9 +541,11 @@ export function useDrawingPersistence({
     saveStatus,
     isDirty: saveStatus === 'dirty',
     isSaving,
+    isOpeningFile,
+    isFileOperating,
     isSignOutSafe:
       storageMode !== 'drive' ||
-      (!isSaving && !isDebouncing && saveStatus !== 'dirty' && saveStatus !== 'error' && saveStatus !== 'saving'),
+      (!isSaving && !isDebouncing && !isOpeningFile && !isFileOperating && saveStatus !== 'dirty' && saveStatus !== 'error' && saveStatus !== 'saving'),
     lastSavedAt,
     errorMessage,
     isLoading,

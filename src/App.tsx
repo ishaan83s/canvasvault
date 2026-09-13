@@ -92,14 +92,7 @@ function MainLayout() {
   };
 
   const handleSignOutRequest = () => {
-    const isUnsafeSignOut =
-      persistence.storageMode === 'drive' &&
-      (persistence.isSaving ||
-        persistence.saveStatus === 'dirty' ||
-        persistence.saveStatus === 'error' ||
-        persistence.saveStatus === 'saving');
-
-    if (isUnsafeSignOut) {
+    if (!persistence.isSignOutSafe) {
       setSignOutSaveError(null);
       setIsSignOutModalOpen(true);
     } else {
