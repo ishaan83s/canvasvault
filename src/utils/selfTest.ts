@@ -1953,29 +1953,59 @@ export async function runPersistenceSelfTests(): Promise<{ passed: boolean; resu
       | { type: 'new' };
 
     class UnsavedSwitchOrchestratorHarness {
-      public currentFileId: any = 'file_1';
-      public currentFileName: any = 'File 1';
-      public saveStatus: any = 'saved';
-      public isSaving: any = false;
-      public isDebouncing: any = false;
-      public isDirty: any = false;
-      public generation: any = 1;
-      public storageMode: any = 'local';
+      public currentFileId: string | null = 'file_1';
+      public currentFileName: string = 'File 1';
+      public saveStatus: string = 'saved';
+      public isSaving: boolean = false;
+      public isDebouncing: boolean = false;
+      public isDirty: boolean = false;
+      public generation: number = 1;
+      public storageMode: 'local' | 'drive' = 'local';
 
       public pendingAction: TestSwitchAction | null = null;
-      public switchSaveError: any = null;
-      public isModalOpen: any = false;
+      public switchSaveError: string | null = null;
+      public isModalOpen: boolean = false;
 
-      public saveCallCount: any = 0;
+      public saveCallCount: number = 0;
       public mockSaveResult: boolean = true;
-      public saveDelayMs: any = 0;
+      public saveDelayMs: number = 0;
       public activeSavePromise: Promise<boolean> | null = null;
-      public cancelledDebouncedSave: any = false;
+      public cancelledDebouncedSave: boolean = false;
+
+      public latestSaveRequestId: number = 0;
+      public activeSaveAbortController: AbortController | null = null;
+      public canvasContent: string = 'content_1_initial';
+      public lastSavedContent: string = 'content_1_initial';
 
       public files: any[] = [
         { id: 'file_1', name: 'File 1.excalidraw' },
         { id: 'file_2', name: 'File 2.excalidraw' },
       ];
+
+      public mockStorage: {
+        records: Record<string, string>;
+        create: (name: string, content: string, signal?: AbortSignal) => Promise<string>;
+        update: (fileId: string, content: string, signal?: AbortSignal) => Promise<void>;
+      };
+
+      constructor(customStorage?: any) {
+        this.mockStorage = customStorage || {
+          records: {
+            file_1: 'content_1_initial',
+            file_2: 'content_2_initial',
+          },
+          create: async (_name: string, content: string, signal?: AbortSignal) => {
+            if (signal?.aborted) throw new Error('Aborted');
+            const id = 'created_' + Date.now();
+            this.mockStorage.records[id] = content;
+            return id;
+          },
+          update: async (fileId: string, content: string, signal?: AbortSignal) => {
+            if (signal?.aborted) throw new Error('Aborted');
+            this.mockStorage.records[fileId] = content;
+          },
+        };
+      }
 
       public isSceneUnsaved(): boolean {
         return (
@@ -2027,29 +2057,113 @@ export async function runPersistenceSelfTests(): Promise<{ passed: boolean; resu
         }
       }
 
+      public cancelPendingSave(): void {
+        this.cancelledDebouncedSave = true;
+        this.isDebouncing = false;
+        this.latestSaveRequestId++;
+        if (this.activeSaveAbortController) {
+          this.activeSaveAbortController.abort();
+          this.activeSaveAbortController = null;
+        }
+        this.activeSavePromise = null;
+        this.isSaving = false;
+      }
+
       public async saveNow(): Promise<boolean> {
         if (this.activeSavePromise) {
           return this.activeSavePromise;
         }
 
+        const opGen = this.generation;
+        const saveRequestId = ++this.latestSaveRequestId;
+        const targetFileId = this.currentFileId;
+        const abortController = new AbortController();
+        this.activeSaveAbortController = abortController;
+
         const p = (async () => {
+          this.isSaving = true;
           this.saveCallCount++;
-          if (this.saveDelayMs > 0) {
-            await new Promise((r) => setTimeout(r, this.saveDelayMs));
-          }
-          if (this.mockSaveResult) {
+          try {
+            this.saveStatus = 'saving';
+            if (this.saveDelayMs > 0) {
+              await new Promise((r) => setTimeout(r, this.saveDelayMs));
+            }
+
+            const serialized = this.canvasContent;
+            let targetId = targetFileId;
+
+            if (
+              opGen !== this.generation ||
+              saveRequestId !== this.latestSaveRequestId ||
+              abortController.signal.aborted ||
+              (targetFileId !== null && this.currentFileId !== targetFileId)
+            ) {
+              return false;
+            }
+
+            if (!targetId) {
+              targetId = await this.mockStorage.create(this.currentFileName, serialized, abortController.signal);
+              if (
+                opGen !== this.generation ||
+                saveRequestId !== this.latestSaveRequestId ||
+                abortController.signal.aborted ||
+                this.currentFileId !== null
+              ) {
+                return false;
+              }
+              this.currentFileId = targetId;
+            } else {
+              await this.mockStorage.update(targetId, serialized, abortController.signal);
+              if (
+                opGen !== this.generation ||
+                saveRequestId !== this.latestSaveRequestId ||
+                abortController.signal.aborted ||
+                this.currentFileId !== targetId
+              ) {
+                return false;
+              }
+            }
+
+            if (!this.mockSaveResult) {
+              throw new Error('Save failed');
+            }
+
+            this.lastSavedContent = serialized;
             this.saveStatus = 'saved';
             this.isDirty = false;
+            return (
+              opGen === this.generation &&
+              saveRequestId === this.latestSaveRequestId &&
+              !abortController.signal.aborted
+            );
+          } catch (err: any) {
+            if (
+              opGen === this.generation &&
+              saveRequestId === this.latestSaveRequestId &&
+              !abortController.signal.aborted &&
+              (targetFileId === null ? this.currentFileId === null : this.currentFileId === targetFileId)
+            ) {
+              this.saveStatus = 'error';
+              this.switchSaveError = err?.message || 'Save failed';
+            }
+            return false;
+          } finally {
+            if (this.activeSaveAbortController === abortController) {
+              this.activeSaveAbortController = null;
+            }
+            if (
+              opGen === this.generation &&
+              saveRequestId === this.latestSaveRequestId &&
+              !abortController.signal.aborted
+            ) {
+              this.isSaving = false;
+              this.activeSavePromise = null;
+            }
           }
-          return this.mockSaveResult;
         })();
 
         this.activeSavePromise = p;
-        try {
-          return await p;
-        } finally {
-          this.activeSavePromise = null;
-        }
+        return p;
       }
 
       public activeSwitchPromise: Promise<boolean> | null = null;
@@ -2078,9 +2192,13 @@ export async function runPersistenceSelfTests(): Promise<{ passed: boolean; resu
               this.currentFileId = action.targetFileId;
               const target = this.files.find((f) => f.id === action.targetFileId);
               this.currentFileName = target ? target.name : 'Untitled';
+              this.canvasContent = this.mockStorage.records[action.targetFileId] || '';
+              this.lastSavedContent = this.canvasContent;
             } else {
               this.currentFileId = 'new_created_id';
               this.currentFileName = 'Untitled';
+              this.canvasContent = JSON.stringify({ name: 'Untitled', elements: [] });
+              this.lastSavedContent = this.canvasContent;
             }
             return true;
           } catch (err: any) {
@@ -2101,17 +2219,23 @@ export async function runPersistenceSelfTests(): Promise<{ passed: boolean; resu
         this.pendingAction = null;
         this.isModalOpen = false;
         this.switchSaveError = null;
-        this.cancelledDebouncedSave = true;
+
+        // Invalidate in-flight and debounced saves BEFORE switching files or creating new file
+        this.cancelPendingSave();
 
         if (action.type === 'switch') {
           this.currentFileId = action.targetFileId;
           const target = this.files.find((f) => f.id === action.targetFileId);
           this.currentFileName = target ? target.name : 'Untitled';
+          this.canvasContent = this.mockStorage.records[action.targetFileId] || '';
+          this.lastSavedContent = this.canvasContent;
           this.saveStatus = 'saved';
           this.isDirty = false;
         } else {
           this.currentFileId = 'new_created_id';
           this.currentFileName = 'Untitled';
+          this.canvasContent = JSON.stringify({ name: 'Untitled', elements: [] });
+          this.lastSavedContent = this.canvasContent;
           this.saveStatus = 'saved';
           this.isDirty = false;
         }
@@ -2276,6 +2400,280 @@ export async function runPersistenceSelfTests(): Promise<{ passed: boolean; resu
     const flightOutcome = await pendingSave;
     if (flightOutcome !== false || harnessGenFlight.currentFileId !== 'file_1') {
       throw new Error('Save across generation transition must not authorize file switch');
+    }
+
+    // N. Deterministic in-flight save invalidation on Discard and Switch
+    // 1. Start with File A loaded.
+    // 2. Modify File A so it is dirty.
+    // 3. Start saveNow() for File A.
+    // 4. Pause/block the mocked underlying Drive save so the promise remains pending.
+    // 5. While that save is pending, trigger Discard and Switch.
+    // 6. The discard operation must invalidate the old save.
+    // 7. Release/resolve the previously pending save promise.
+    // 8. Assert that the old File A scene is NOT persisted by that stale save.
+    // 9. Assert the new navigation/create operation remains valid.
+    // 10. Assert there is no later stale completion that can overwrite the newly selected file/scene.
+    let resolveStorageUpdateA: () => void = () => {};
+    let storageUpdateSignal: AbortSignal | undefined;
+    const storageMap: Record<string, string> = {
+      file_A: 'scene_A_clean',
+      file_B: 'scene_B_clean',
+    };
+
+    const mockRaceStorage = {
+      records: storageMap,
+      create: async (_name: string, _content: string) => {
+        return 'created_file';
+      },
+      update: async (fileId: string, content: string, signal?: AbortSignal) => {
+        storageUpdateSignal = signal;
+        if (fileId === 'file_A') {
+          await new Promise<void>((resolve) => {
+            resolveStorageUpdateA = resolve;
+          });
+          if (signal?.aborted) {
+            throw new Error('Save aborted by user discard');
+          }
+        }
+        storageMap[fileId] = content;
+      },
+    };
+
+    const harnessRaceSwitch = new UnsavedSwitchOrchestratorHarness(mockRaceStorage);
+    harnessRaceSwitch.files = [
+      { id: 'file_A', name: 'Drawing A.excalidraw' },
+      { id: 'file_B', name: 'Drawing B.excalidraw' },
+    ];
+    harnessRaceSwitch.currentFileId = 'file_A';
+    harnessRaceSwitch.currentFileName = 'Drawing A';
+    harnessRaceSwitch.canvasContent = 'scene_A_clean';
+    harnessRaceSwitch.lastSavedContent = 'scene_A_clean';
+    harnessRaceSwitch.saveStatus = 'saved';
+
+    // Step 2: Modify File A so it is dirty
+    harnessRaceSwitch.canvasContent = 'scene_A_DIRTY_DISCARDED';
+    harnessRaceSwitch.isDirty = true;
+    harnessRaceSwitch.saveStatus = 'dirty';
+
+    // Step 3 & 4: Start saveNow() for File A, paused in flight
+    const inFlightSavePromise = harnessRaceSwitch.saveNow();
+    if (!harnessRaceSwitch.isSaving) {
+      throw new Error('Save should be in-flight (isSaving=true)');
+    }
+
+    // Step 5: While that save is pending, trigger Discard and Switch
+    harnessRaceSwitch.handleSelectFileRequest('file_B');
+    if (!harnessRaceSwitch.isModalOpen || harnessRaceSwitch.pendingAction?.type !== 'switch') {
+      throw new Error('UnsavedSwitchModal should open for dirty File A on switch');
+    }
+
+    // Step 6: Discard operation invalidates the old save before file switch proceeds
+    harnessRaceSwitch.handleDiscardAndProceed();
+    if (harnessRaceSwitch.isModalOpen) {
+      throw new Error('Modal must close after Discard and Switch');
+    }
+    if (harnessRaceSwitch.currentFileId !== 'file_B') {
+      throw new Error(`Expected active file to be file_B, got ${harnessRaceSwitch.currentFileId}`);
+    }
+    if (harnessRaceSwitch.canvasContent !== 'scene_B_clean') {
+      throw new Error(`Expected active canvas to be scene_B_clean, got ${harnessRaceSwitch.canvasContent}`);
+    }
+
+    // Verify signal was aborted by cancelPendingSave()
+    if (!storageUpdateSignal?.aborted) {
+      throw new Error('Active save AbortSignal was not aborted upon Discard');
+    }
+
+    // Step 7: Release/resolve the previously pending save promise
+    resolveStorageUpdateA();
+    const saveOutcome = await inFlightSavePromise;
+
+    // Step 8: Assert that the old File A scene is NOT persisted by that stale save
+    if (saveOutcome !== false) {
+      throw new Error('Stale in-flight save must return false when resolved');
+    }
+    if (storageMap['file_A'] !== 'scene_A_clean') {
+      throw new Error(
+        `CRITICAL RACE: Discarded content was persisted to storage! Expected scene_A_clean, got ${storageMap['file_A']}`
+      );
+    }
+
+    // Step 9: Assert the new navigation operation remains valid
+    if (harnessRaceSwitch.currentFileId !== 'file_B') {
+      throw new Error('Stale save completion corrupted currentFileId away from File B');
+    }
+    if (harnessRaceSwitch.canvasContent !== 'scene_B_clean') {
+      throw new Error('Stale save completion corrupted File B canvas content');
+    }
+    if (harnessRaceSwitch.saveStatus !== 'saved') {
+      throw new Error(`Expected File B saveStatus=saved, got ${harnessRaceSwitch.saveStatus}`);
+    }
+    if (harnessRaceSwitch.isDirty) {
+      throw new Error('Expected File B to remain clean (isDirty=false)');
+    }
+    if (harnessRaceSwitch.isSaving) {
+      throw new Error('isSaving should be false after stale save resolves');
+    }
+
+    // Step 10: Assert subsequent save on File B persists correctly without interference
+    harnessRaceSwitch.canvasContent = 'scene_B_new_changes';
+    harnessRaceSwitch.isDirty = true;
+    harnessRaceSwitch.saveStatus = 'dirty';
+    const fileBSaveResult = await harnessRaceSwitch.saveNow();
+    if (!fileBSaveResult) {
+      throw new Error('Subsequent save on File B should succeed');
+    }
+    if (storageMap['file_B'] !== 'scene_B_new_changes') {
+      throw new Error(`File B changes were not saved: ${storageMap['file_B']}`);
+    }
+    if (storageMap['file_A'] !== 'scene_A_clean') {
+      throw new Error('File A storage was modified during File B operations');
+    }
+
+    // O. Deterministic in-flight save invalidation on Discard and Create (+ New)
+    let resolveStorageUpdateCreate: () => void = () => {};
+    let createStorageSignal: AbortSignal | undefined;
+    const storageMapCreate: Record<string, string> = {
+      file_A: 'scene_A_initial',
+    };
+
+    const mockRaceCreateStorage = {
+      records: storageMapCreate,
+      create: async (_name: string, _content: string) => {
+        const id = 'new_created_' + Date.now();
+        storageMapCreate[id] = _content;
+        return id;
+      },
+      update: async (fileId: string, content: string, signal?: AbortSignal) => {
+        createStorageSignal = signal;
+        if (fileId === 'file_A') {
+          await new Promise<void>((resolve) => {
+            resolveStorageUpdateCreate = resolve;
+          });
+          if (signal?.aborted) {
+            throw new Error('Save aborted by user discard');
+          }
+        }
+        storageMapCreate[fileId] = content;
+      },
+    };
+
+    const harnessRaceCreate = new UnsavedSwitchOrchestratorHarness(mockRaceCreateStorage);
+    harnessRaceCreate.currentFileId = 'file_A';
+    harnessRaceCreate.currentFileName = 'Drawing A';
+    harnessRaceCreate.canvasContent = 'scene_A_initial';
+    harnessRaceCreate.lastSavedContent = 'scene_A_initial';
+    harnessRaceCreate.saveStatus = 'saved';
+
+    // Modify File A
+    harnessRaceCreate.canvasContent = 'scene_A_DISCARDED_FOR_NEW';
+    harnessRaceCreate.isDirty = true;
+    harnessRaceCreate.saveStatus = 'dirty';
+
+    // Start saveNow() in flight
+    const inFlightSaveCreatePromise = harnessRaceCreate.saveNow();
+    if (!harnessRaceCreate.isSaving) {
+      throw new Error('Save should be in-flight before Discard and Create');
+    }
+
+    // Trigger "+ New"
+    harnessRaceCreate.handleNewDrawingRequest();
+    if (!harnessRaceCreate.isModalOpen || harnessRaceCreate.pendingAction?.type !== 'new') {
+      throw new Error('Modal must prompt for Discard and Create');
+    }
+
+    // Discard and Create
+    harnessRaceCreate.handleDiscardAndProceed();
+    if (harnessRaceCreate.isModalOpen) {
+      throw new Error('Modal must close after Discard and Create');
+    }
+    if (harnessRaceCreate.currentFileId === 'file_A') {
+      throw new Error('Active file must switch away from file_A upon Discard and Create');
+    }
+    if (!createStorageSignal?.aborted) {
+      throw new Error('Active save AbortSignal was not aborted upon Discard and Create');
+    }
+
+    // Release the paused save
+    resolveStorageUpdateCreate();
+    const staleCreateOutcome = await inFlightSaveCreatePromise;
+
+    // Assert stale save did not persist and did not corrupt new drawing
+    if (staleCreateOutcome !== false) {
+      throw new Error('Stale save must return false');
+    }
+    if (storageMapCreate['file_A'] !== 'scene_A_initial') {
+      throw new Error('CRITICAL RACE: Discarded content was persisted to File A during Discard and Create');
+    }
+    if (harnessRaceCreate.currentFileId === 'file_A') {
+      throw new Error('Stale save completion hijacked currentFileId back to file_A');
+    }
+    if (harnessRaceCreate.saveStatus !== 'saved') {
+      throw new Error(`Expected new file saveStatus=saved, got ${harnessRaceCreate.saveStatus}`);
+    }
+
+    // P. Deterministic in-flight save on transient/untitled drawing invalidation on Discard
+    let resolveStorageCreate: () => void = () => {};
+    let transientStorageSignal: AbortSignal | undefined;
+    const transientStorageMap: Record<string, string> = {
+      file_existing: 'existing_file_content',
+    };
+
+    const mockTransientStorage = {
+      records: transientStorageMap,
+      create: async (_name: string, content: string, signal?: AbortSignal) => {
+        transientStorageSignal = signal;
+        await new Promise<void>((resolve) => {
+          resolveStorageCreate = resolve;
+        });
+        if (signal?.aborted) {
+          throw new Error('Creation aborted by discard');
+        }
+        const id = 'transient_assigned_id';
+        transientStorageMap[id] = content;
+        return id;
+      },
+      update: async (fileId: string, content: string) => {
+        transientStorageMap[fileId] = content;
+      },
+    };
+
+    const harnessTransient = new UnsavedSwitchOrchestratorHarness(mockTransientStorage);
+    harnessTransient.currentFileId = null;
+    harnessTransient.currentFileName = 'Untitled';
+    harnessTransient.canvasContent = 'transient_dirty_content';
+    harnessTransient.isDirty = true;
+    harnessTransient.saveStatus = 'dirty';
+
+    // Start saveNow() for transient drawing
+    const transientSavePromise = harnessTransient.saveNow();
+    if (!harnessTransient.isSaving) {
+      throw new Error('Transient save was not started in flight');
+    }
+
+    // While in flight, user switches to existing file and discards transient work
+    harnessTransient.handleSelectFileRequest('file_existing');
+    harnessTransient.handleDiscardAndProceed();
+
+    if (harnessTransient.currentFileId !== 'file_existing') {
+      throw new Error('File switch to file_existing must take effect');
+    }
+    if (!transientStorageSignal?.aborted) {
+      throw new Error('Transient create signal was not aborted on discard');
+    }
+
+    // Release the paused create
+    resolveStorageCreate();
+    const transientOutcome = await transientSavePromise;
+
+    if (transientOutcome !== false) {
+      throw new Error('Transient stale save must return false');
+    }
+    if (transientStorageMap['transient_assigned_id'] !== undefined) {
+      throw new Error('Discarded transient drawing was created in storage after discard');
+    }
+    if (harnessTransient.currentFileId !== 'file_existing') {
+      throw new Error('Transient create completion overwrote currentFileId');
     }
   });
 

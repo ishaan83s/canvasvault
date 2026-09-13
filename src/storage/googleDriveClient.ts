@@ -90,6 +90,9 @@ export class GoogleDriveClient {
       if (err instanceof GoogleDriveError) {
         throw err;
       }
+      if ((err as any)?.name === 'AbortError' || init.signal?.aborted) {
+        throw err;
+      }
       throw new GoogleDriveError('NETWORK_ERROR', undefined);
     }
 
@@ -212,7 +215,7 @@ export class GoogleDriveClient {
    * Rejects arbitrary file IDs, trashed files, files outside CanvasVault folder,
    * or files lacking the CanvasVault drawing marker.
    */
-  async validateManagedFile(fileId: string): Promise<DriveFileMetadata> {
+  async validateManagedFile(fileId: string, signal?: AbortSignal): Promise<DriveFileMetadata> {
     if (!fileId || typeof fileId !== 'string' || !fileId.trim()) {
       throw new Error(`Drawing not found: ${fileId}`);
     }
@@ -226,7 +229,8 @@ export class GoogleDriveClient {
     let response: Response;
     try {
       response = await this.authenticatedFetch(
-        `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?${params.toString()}`
+        `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?${params.toString()}`,
+        { signal }
       );
     } catch (err) {
       if (err instanceof GoogleDriveError && err.code === 'NOT_FOUND') {
@@ -262,7 +266,8 @@ export class GoogleDriveClient {
   async createMultipartFile(
     name: string,
     content: string,
-    extraAppProperties?: Record<string, string>
+    extraAppProperties?: Record<string, string>,
+    signal?: AbortSignal
   ): Promise<DriveFileMetadata> {
     const folderId = await this.getOrCreateFolder();
     const boundary = `CanvasVaultBoundary${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
@@ -299,6 +304,7 @@ export class GoogleDriveClient {
             'Content-Type': `multipart/related; boundary=${boundary}`,
           },
           body: multipartBody,
+          signal,
         }
       );
     } catch (err) {
@@ -325,9 +331,9 @@ export class GoogleDriveClient {
   /**
    * Updates an existing drawing file's content in-place via media upload.
    */
-  async updateMediaFile(fileId: string, content: string): Promise<void> {
+  async updateMediaFile(fileId: string, content: string, signal?: AbortSignal): Promise<void> {
     // Validates managed ownership prior to mutation
-    await this.validateManagedFile(fileId);
+    await this.validateManagedFile(fileId, signal);
 
     await this.authenticatedFetch(
       `https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(fileId)}?uploadType=media`,
@@ -337,6 +343,7 @@ export class GoogleDriveClient {
           'Content-Type': 'application/json; charset=UTF-8',
         },
         body: content,
+        signal,
       }
     );
   }

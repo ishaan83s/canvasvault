@@ -49,6 +49,8 @@ export function useDrawingPersistence({
   // Monotonic sequence guards to drop stale out-of-order async operations
   const latestLoadRequestIdRef = useRef<number>(0);
   const latestListRequestIdRef = useRef<number>(0);
+  const latestSaveRequestIdRef = useRef<number>(0);
+  const activeSaveAbortControllerRef = useRef<AbortController | null>(null);
   const activeCreatePromiseRef = useRef<Promise<string | null> | null>(null);
 
   // Synchronous tracking of current active file ID to prevent duplicate file creations
@@ -92,6 +94,11 @@ export function useDrawingPersistence({
     }
 
     const opGen = storageGenerationRef.current;
+    const saveRequestId = ++latestSaveRequestIdRef.current;
+    const targetFileId = currentFileIdRef.current;
+    const abortController = new AbortController();
+    activeSaveAbortControllerRef.current = abortController;
+
     const savePromise = (async () => {
       isSavingRef.current = true;
       setIsSaving(true);
@@ -106,11 +113,25 @@ export function useDrawingPersistence({
 
         const serialized = serializeDrawing(elements, appState, binaryFiles);
 
-        let targetId = currentFileIdRef.current;
+        let targetId = targetFileId;
+        if (
+          opGen !== storageGenerationRef.current ||
+          saveRequestId !== latestSaveRequestIdRef.current ||
+          abortController.signal.aborted ||
+          (targetFileId !== null && currentFileIdRef.current !== targetFileId)
+        ) {
+          return false;
+        }
+
         if (!targetId) {
           // First save on a new/transient drawing: create exactly once
-          targetId = await storage.create(currentFileName, serialized);
-          if (opGen !== storageGenerationRef.current) {
+          targetId = await storage.create(currentFileName, serialized, abortController.signal);
+          if (
+            opGen !== storageGenerationRef.current ||
+            saveRequestId !== latestSaveRequestIdRef.current ||
+            abortController.signal.aborted ||
+            currentFileIdRef.current !== null
+          ) {
             return false;
           }
 
@@ -121,8 +142,13 @@ export function useDrawingPersistence({
           }
         } else {
           // Subsequent save: update existing file
-          await storage.update(targetId, serialized);
-          if (opGen !== storageGenerationRef.current) {
+          await storage.update(targetId, serialized, abortController.signal);
+          if (
+            opGen !== storageGenerationRef.current ||
+            saveRequestId !== latestSaveRequestIdRef.current ||
+            abortController.signal.aborted ||
+            currentFileIdRef.current !== targetId
+          ) {
             return false;
           }
         }
@@ -132,9 +158,18 @@ export function useDrawingPersistence({
         setLastSavedAt(new Date());
         setSaveStatus('saved');
         await refreshFiles();
-        return opGen === storageGenerationRef.current;
+        return (
+          opGen === storageGenerationRef.current &&
+          saveRequestId === latestSaveRequestIdRef.current &&
+          !abortController.signal.aborted
+        );
       } catch (err) {
-        if (opGen === storageGenerationRef.current) {
+        if (
+          opGen === storageGenerationRef.current &&
+          saveRequestId === latestSaveRequestIdRef.current &&
+          !abortController.signal.aborted &&
+          (targetFileId === null ? currentFileIdRef.current === null : currentFileIdRef.current === targetFileId)
+        ) {
           console.error('Save failed:', err);
           setSaveStatus('error');
           setErrorMessage(err instanceof Error ? err.message : 'Save failed');
@@ -142,9 +177,18 @@ export function useDrawingPersistence({
         // Zero silent fallback to LocalStorage! Scene remains in-memory dirty for manual retry.
         return false;
       } finally {
-        isSavingRef.current = false;
-        setIsSaving(false);
-        activeSavePromiseRef.current = null;
+        if (activeSaveAbortControllerRef.current === abortController) {
+          activeSaveAbortControllerRef.current = null;
+        }
+        if (
+          opGen === storageGenerationRef.current &&
+          saveRequestId === latestSaveRequestIdRef.current &&
+          !abortController.signal.aborted
+        ) {
+          isSavingRef.current = false;
+          setIsSaving(false);
+          activeSavePromiseRef.current = null;
+        }
       }
     })();
 
@@ -158,6 +202,18 @@ export function useDrawingPersistence({
       await executeSave();
     },
   });
+
+  const cancelPendingSave = useCallback(() => {
+    cancelDebouncedSave();
+    latestSaveRequestIdRef.current++;
+    if (activeSaveAbortControllerRef.current) {
+      activeSaveAbortControllerRef.current.abort();
+      activeSaveAbortControllerRef.current = null;
+    }
+    activeSavePromiseRef.current = null;
+    isSavingRef.current = false;
+    setIsSaving(false);
+  }, [cancelDebouncedSave]);
 
   const saveNow = useCallback(async (): Promise<boolean> => {
     cancelDebouncedSave();
@@ -183,7 +239,7 @@ export function useDrawingPersistence({
     async (fileId: string) => {
       if (!api) return;
 
-      cancelDebouncedSave();
+      cancelPendingSave();
       const opGen = storageGenerationRef.current;
       const loadRequestId = ++latestLoadRequestIdRef.current;
       setIsLoading(true);
@@ -252,7 +308,7 @@ export function useDrawingPersistence({
         }
       }
     },
-    [api, cancelDebouncedSave, storage, storageMode, refreshFiles]
+    [api, cancelPendingSave, storage, storageMode, refreshFiles]
   );
 
   // Create a new blank drawing with concurrency deduplication
@@ -263,7 +319,7 @@ export function useDrawingPersistence({
         return activeCreatePromiseRef.current;
       }
 
-      cancelDebouncedSave();
+      cancelPendingSave();
       const opGen = storageGenerationRef.current;
       const loadRequestId = ++latestLoadRequestIdRef.current;
       setIsLoading(true);
@@ -318,7 +374,7 @@ export function useDrawingPersistence({
       activeCreatePromiseRef.current = createPromise;
       return createPromise;
     },
-    [api, cancelDebouncedSave, storage, storageMode, refreshFiles]
+    [api, cancelPendingSave, storage, storageMode, refreshFiles]
   );
 
   // Rename drawing with operation status tracking
@@ -354,7 +410,7 @@ export function useDrawingPersistence({
   // Delete drawing with operation status tracking and debounce cancellation
   const deleteDrawing = useCallback(
     async (fileId: string) => {
-      cancelDebouncedSave();
+      cancelPendingSave();
       const opGen = storageGenerationRef.current;
       setIsFileOperating(true);
       try {
@@ -387,11 +443,11 @@ export function useDrawingPersistence({
         }
       }
     },
-    [storage, refreshFiles, openDrawing, createNewDrawing, cancelDebouncedSave]
+    [storage, refreshFiles, openDrawing, createNewDrawing, cancelPendingSave]
   );
 
   const discardUnsavedDriveChanges = useCallback(async () => {
-    cancelDebouncedSave();
+    cancelPendingSave();
     if (!api) return;
 
     try {
@@ -444,7 +500,7 @@ export function useDrawingPersistence({
     lastSavedContentRef.current = '';
     lastSceneVersionRef.current = 0;
     setSaveStatus('saved');
-  }, [api, cancelDebouncedSave, selection.localStorage]);
+  }, [api, cancelPendingSave, selection.localStorage]);
 
   // Storage transition handler: local <-> drive
   useEffect(() => {
@@ -456,8 +512,8 @@ export function useDrawingPersistence({
     previousModeRef.current = storageMode;
     storageGenerationRef.current = generation;
 
-    // 1. Invalidate pending debounced saves
-    cancelDebouncedSave();
+    // 1. Invalidate pending debounced saves and in-flight saves
+    cancelPendingSave();
 
     // 2. Invalidate any in-flight load requests or create requests from previous mode
     latestLoadRequestIdRef.current++;
@@ -500,7 +556,7 @@ export function useDrawingPersistence({
 
     // 5. Populate sidebar with drawings from the new active backend
     refreshFiles();
-  }, [storageMode, generation, cancelDebouncedSave, refreshFiles, openDrawing, createNewDrawing]);
+  }, [storageMode, generation, cancelPendingSave, refreshFiles, openDrawing, createNewDrawing]);
 
   // Initial load when API is mounted for the first time
   useEffect(() => {
@@ -555,7 +611,7 @@ export function useDrawingPersistence({
     activeStorage: storage,
     driveAdapter: selection.driveAdapter,
     saveNow,
-    cancelPendingSave: cancelDebouncedSave,
+    cancelPendingSave,
     discardUnsavedDriveChanges,
     handleCanvasChange,
     openDrawing,

@@ -40,7 +40,10 @@ export class LocalStorageAdapter implements DrawingStorage {
     return content;
   }
 
-  async create(name: string, content: string): Promise<string> {
+  async create(name: string, content: string, signal?: AbortSignal): Promise<string> {
+    if (signal?.aborted) {
+      throw new Error('Save operation aborted');
+    }
     const safeName = ensureExcalidrawExtension(name || 'Untitled');
     const id = generateId();
     const now = new Date().toISOString();
@@ -61,7 +64,10 @@ export class LocalStorageAdapter implements DrawingStorage {
     return id;
   }
 
-  async update(fileId: string, content: string): Promise<void> {
+  async update(fileId: string, content: string, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) {
+      throw new Error('Save operation aborted');
+    }
     const files = this.getIndex();
     const fileIndex = files.findIndex((f) => f.id === fileId);
     if (fileIndex === -1) {

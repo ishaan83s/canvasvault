@@ -49,11 +49,11 @@ export class GoogleDriveAdapter implements DrawingStorage {
    * Creates a new drawing file in the CanvasVault folder via multipart upload.
    * Returns the Google Drive file ID.
    */
-  async create(name: string, content: string): Promise<string> {
+  async create(name: string, content: string, signal?: AbortSignal): Promise<string> {
     this.assertValidDrawingContent(content);
     const safeName = ensureExcalidrawExtension(name || 'Untitled');
 
-    const file = await this.client.createMultipartFile(safeName, content);
+    const file = await this.client.createMultipartFile(safeName, content, undefined, signal);
     return file.id;
   }
 
@@ -64,12 +64,13 @@ export class GoogleDriveAdapter implements DrawingStorage {
   async createWithProperties(
     name: string,
     content: string,
-    extraAppProperties?: Record<string, string>
+    extraAppProperties?: Record<string, string>,
+    signal?: AbortSignal
   ): Promise<string> {
     this.assertValidDrawingContent(content);
     const safeName = ensureExcalidrawExtension(name || 'Untitled');
 
-    const file = await this.client.createMultipartFile(safeName, content, extraAppProperties);
+    const file = await this.client.createMultipartFile(safeName, content, extraAppProperties, signal);
     return file.id;
   }
 
@@ -77,9 +78,9 @@ export class GoogleDriveAdapter implements DrawingStorage {
    * Updates an existing drawing file's content in-place.
    * Enforces centralized ownership validation before mutation.
    */
-  async update(fileId: string, content: string): Promise<void> {
+  async update(fileId: string, content: string, signal?: AbortSignal): Promise<void> {
     this.assertValidDrawingContent(content);
-    await this.client.updateMediaFile(fileId, content);
+    await this.client.updateMediaFile(fileId, content, signal);
   }
 
   /**

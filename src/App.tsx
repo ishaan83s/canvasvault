@@ -148,7 +148,6 @@ function MainLayout() {
     setPrevSwitchMode(persistence.storageMode);
     setPendingSwitchAction(null);
     setSwitchSaveError(null);
-    activeSwitchPromiseRef.current = null;
   }
 
   const isSceneUnsaved =
