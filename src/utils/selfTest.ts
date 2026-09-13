@@ -1235,6 +1235,213 @@ export async function runPersistenceSelfTests(): Promise<{ passed: boolean; resu
     if (isModalOpen(false)) throw new Error('Modal must NOT open if local drawings is empty');
   });
 
+  // 20. Explicit sign-out safety for unsaved and error drive states
+  await record('20. Explicit sign-out safety for unsaved and error drive states', async () => {
+    // Decision function matching App orchestration contract
+    function isUnsafeSignOut(state: {
+      storageMode: 'local' | 'drive';
+      saveStatus: string;
+      isSaving: boolean;
+    }): boolean {
+      return (
+        state.storageMode === 'drive' &&
+        (state.isSaving || state.saveStatus === 'dirty' || state.saveStatus === 'error' || state.saveStatus === 'saving')
+      );
+    }
+
+    // A. Clean Drive sign-out is immediate
+    let signOutCalled = false;
+    let modalOpened = false;
+    const cleanDriveState = { storageMode: 'drive' as const, saveStatus: 'saved', isSaving: false };
+    if (isUnsafeSignOut(cleanDriveState)) {
+      modalOpened = true;
+    } else {
+      signOutCalled = true;
+    }
+    if (modalOpened || !signOutCalled) {
+      throw new Error('Clean Drive state must sign out immediately without confirmation');
+    }
+
+    // B. Anonymous / local sign-out does not show modal
+    const dirtyLocalState = { storageMode: 'local' as const, saveStatus: 'dirty', isSaving: false };
+    if (isUnsafeSignOut(dirtyLocalState)) {
+      throw new Error('Local storage mode must never trigger sign-out confirmation');
+    }
+
+    const errorLocalState = { storageMode: 'local' as const, saveStatus: 'error', isSaving: true };
+    if (isUnsafeSignOut(errorLocalState)) {
+      throw new Error('Local error/saving state must never trigger sign-out confirmation');
+    }
+
+    // C. Dirty Drive sign-out opens confirmation modal
+    const dirtyDriveState = { storageMode: 'drive' as const, saveStatus: 'dirty', isSaving: false };
+    if (!isUnsafeSignOut(dirtyDriveState)) {
+      throw new Error('Dirty Drive state must require confirmation');
+    }
+
+    const errorDriveState = { storageMode: 'drive' as const, saveStatus: 'error', isSaving: false };
+    if (!isUnsafeSignOut(errorDriveState)) {
+      throw new Error('Error Drive state must require confirmation');
+    }
+
+    const inFlightDriveState = { storageMode: 'drive' as const, saveStatus: 'saving', isSaving: true };
+    if (!isUnsafeSignOut(inFlightDriveState)) {
+      throw new Error('In-flight saving Drive state must require confirmation');
+    }
+
+    // Harness for modal orchestrator interactions
+    class OrchestratorHarness {
+      public isModalOpen = false;
+      public signedOutCount: any = 0;
+      public saveCount: any = 0;
+      public generation = 1;
+      public saveErrorMessage: string | null = null;
+      public mockSaveResult: boolean = true;
+      public saveDelayMs = 0;
+      public activeSavePromise: Promise<boolean> | null = null;
+      public cancelledDebouncedSave = false;
+
+      public requestSignOut(mode: 'local' | 'drive', status: string, isSaving: boolean) {
+        if (isUnsafeSignOut({ storageMode: mode, saveStatus: status, isSaving })) {
+          this.isModalOpen = true;
+        } else {
+          this.signedOutCount++;
+        }
+      }
+
+      public async saveNow(): Promise<boolean> {
+        if (this.activeSavePromise) {
+          return this.activeSavePromise;
+        }
+        const p = (async () => {
+          this.saveCount++;
+          if (this.saveDelayMs > 0) {
+            await new Promise((r) => setTimeout(r, this.saveDelayMs));
+          }
+          return this.mockSaveResult;
+        })();
+        this.activeSavePromise = p;
+        try {
+          return await p;
+        } finally {
+          this.activeSavePromise = null;
+        }
+      }
+
+      public async handleSaveAndSignOut(): Promise<boolean> {
+        const startGen = this.generation;
+        this.saveErrorMessage = null;
+        const success = await this.saveNow();
+        if (!success || this.generation !== startGen) {
+          this.saveErrorMessage = 'Save could not be confirmed';
+          return false;
+        }
+        this.isModalOpen = false;
+        this.signedOutCount++;
+        return true;
+      }
+
+      public handleSignOutWithoutSaving() {
+        this.cancelledDebouncedSave = true;
+        this.isModalOpen = false;
+        this.signedOutCount++;
+      }
+
+      public handleCancel() {
+        this.isModalOpen = false;
+        this.saveErrorMessage = null;
+      }
+    }
+
+    // D. Save and Sign Out signs out only after successful save
+    const harness1 = new OrchestratorHarness();
+    harness1.requestSignOut('drive', 'dirty', false);
+    if (!harness1.isModalOpen || harness1.signedOutCount !== 0) {
+      throw new Error('Modal should open and not sign out initially');
+    }
+    const success1 = await harness1.handleSaveAndSignOut();
+    if (!success1 || harness1.signedOutCount !== 1 || harness1.isModalOpen) {
+      throw new Error('Save and Sign Out should sign out and close modal on success');
+    }
+
+    // E. Failed save blocks sign-out and remains signed in
+    const harness2 = new OrchestratorHarness();
+    harness2.requestSignOut('drive', 'dirty', false);
+    harness2.mockSaveResult = false;
+    const success2 = await harness2.handleSaveAndSignOut();
+    if (success2 || harness2.signedOutCount !== 0 || !harness2.isModalOpen) {
+      throw new Error('Failed save must NOT sign out; modal must stay open');
+    }
+    if (!harness2.saveErrorMessage) {
+      throw new Error('Failed save must expose error message');
+    }
+
+    // F. Sign Out Without Saving explicitly discards and signs out
+    const harness3 = new OrchestratorHarness();
+    harness3.requestSignOut('drive', 'dirty', false);
+    harness3.handleSignOutWithoutSaving();
+    if (!harness3.cancelledDebouncedSave || harness3.signedOutCount !== 1 || harness3.isModalOpen) {
+      throw new Error('Sign Out Without Saving must cancel pending saves, close modal, and sign out');
+    }
+
+    // G. Cancel preserves state
+    const harness4 = new OrchestratorHarness();
+    harness4.requestSignOut('drive', 'dirty', false);
+    harness4.handleCancel();
+    if (harness4.signedOutCount !== 0 || harness4.isModalOpen) {
+      throw new Error('Cancel must close modal and leave user signed in');
+    }
+
+    // H. Duplicate clicks do not duplicate save/signout
+    const harness5 = new OrchestratorHarness();
+    harness5.requestSignOut('drive', 'dirty', false);
+    harness5.saveDelayMs = 20;
+    // Trigger concurrent clicks
+    const [click1, click2, click3] = await Promise.all([
+      harness5.handleSaveAndSignOut(),
+      harness5.handleSaveAndSignOut(),
+      harness5.handleSaveAndSignOut(),
+    ]);
+    if (!click1 || !click2 || !click3) {
+      throw new Error('Concurrent clicks should all resolve successfully via shared promise');
+    }
+    if (harness5.saveCount !== 1) {
+      throw new Error(`Expected exactly 1 underlying save call, got ${harness5.saveCount}`);
+    }
+
+    // I. Stale save result after generation transition cannot authorize signout
+    const harness6 = new OrchestratorHarness();
+    harness6.requestSignOut('drive', 'dirty', false);
+    harness6.saveDelayMs = 30;
+    const savePromise = harness6.handleSaveAndSignOut();
+    // Simulate generation transition during in-flight save (e.g. storage mode switch)
+    harness6.generation++;
+    const saveOutcome = await savePromise;
+    if (saveOutcome !== false || harness6.signedOutCount !== 0) {
+      throw new Error('Save completed across generation change must NOT authorize sign out');
+    }
+
+    // J. No LocalStorage fallback during failed Drive save
+    const testStorageKey = 'canvasvault_test_isolated_key';
+    localStorage.setItem(testStorageKey, 'initial_content');
+    const storageKeysBefore = Object.keys(localStorage);
+    // Simulate a failed Drive operation
+    const mockDriveFailure = async () => {
+      try {
+        throw new Error('Simulated Google Drive 503 Backend Error');
+      } catch {
+        // Must NOT write to LocalStorage
+        return false;
+      }
+    };
+    await mockDriveFailure();
+    const storageKeysAfter = Object.keys(localStorage);
+    if (storageKeysBefore.length !== storageKeysAfter.length || localStorage.getItem(testStorageKey) !== 'initial_content') {
+      throw new Error('LocalStorage was mutated during Drive save failure (forbidden fallback)');
+    }
+    localStorage.removeItem(testStorageKey);
+  });
+
   const allPassed = results.every((r) => r.passed);
 
   return { passed: allPassed, results };

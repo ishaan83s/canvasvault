@@ -4,6 +4,7 @@ import { Whiteboard } from './components/Whiteboard';
 import { TopBar } from './components/TopBar';
 import { FileSidebar } from './components/FileSidebar';
 import { StorageMigrationModal } from './components/StorageMigrationModal';
+import { SignOutConfirmationModal } from './components/SignOutConfirmationModal';
 import { useDrawingPersistence } from './hooks/useDrawingPersistence';
 import { AuthProvider } from './auth/AuthProvider';
 import { useAuth } from './auth/AuthContext';
@@ -80,10 +81,63 @@ function MainLayout() {
     });
   };
 
+  const [isSignOutModalOpen, setIsSignOutModalOpen] = useState<boolean>(false);
+  const [signOutSaveError, setSignOutSaveError] = useState<string | null>(null);
+
   const handleCloseMigration = () => {
     setResolvedSessionGen(sessionGen);
     // Refresh sidebar files from Drive without touching active scene
     persistence.refreshFiles();
+  };
+
+  const handleSignOutRequest = () => {
+    const isUnsafeSignOut =
+      persistence.storageMode === 'drive' &&
+      (persistence.isSaving ||
+        persistence.saveStatus === 'dirty' ||
+        persistence.saveStatus === 'error' ||
+        persistence.saveStatus === 'saving');
+
+    if (isUnsafeSignOut) {
+      setSignOutSaveError(null);
+      setIsSignOutModalOpen(true);
+    } else {
+      auth.signOut();
+    }
+  };
+
+  const handleSaveAndSignOut = async (): Promise<boolean> => {
+    const startGen = persistence.generation;
+    setSignOutSaveError(null);
+
+    try {
+      const success = await persistence.saveNow();
+      if (!success || persistence.generation !== startGen) {
+        setSignOutSaveError(
+          persistence.errorMessage || 'Failed to save drawing to Google Drive. You remain signed in.'
+        );
+        return false;
+      }
+
+      setIsSignOutModalOpen(false);
+      auth.signOut();
+      return true;
+    } catch (err) {
+      setSignOutSaveError(err instanceof Error ? err.message : 'Save failed. You remain signed in.');
+      return false;
+    }
+  };
+
+  const handleSignOutWithoutSaving = async () => {
+    persistence.cancelPendingSave();
+    setIsSignOutModalOpen(false);
+    setSignOutSaveError(null);
+    auth.signOut();
+  };
+
+  const handleCancelSignOut = () => {
+    setIsSignOutModalOpen(false);
+    setSignOutSaveError(null);
   };
 
   return (
@@ -101,6 +155,7 @@ function MainLayout() {
             persistence.renameDrawing(persistence.currentFileId, newName);
           }
         }}
+        onSignOutRequest={handleSignOutRequest}
       />
       <div style={{ display: 'flex', flex: 1, height: 'calc(100vh - 44px)', overflow: 'hidden' }}>
         <FileSidebar
@@ -143,6 +198,13 @@ function MainLayout() {
         onImport={handleImportMigration}
         onSkip={handleSkipMigration}
         onClose={handleCloseMigration}
+      />
+      <SignOutConfirmationModal
+        isOpen={isSignOutModalOpen}
+        onSaveAndSignOut={handleSaveAndSignOut}
+        onSignOutWithoutSaving={handleSignOutWithoutSaving}
+        onCancel={handleCancelSignOut}
+        saveErrorMessage={signOutSaveError}
       />
     </div>
   );

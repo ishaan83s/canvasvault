@@ -13,6 +13,7 @@ interface TopBarProps {
   onSave: () => void;
   onNew: () => void;
   onRename: (newName: string) => void;
+  onSignOutRequest?: () => void;
 }
 
 export const TopBar: React.FC<TopBarProps> = ({
@@ -24,6 +25,7 @@ export const TopBar: React.FC<TopBarProps> = ({
   onSave,
   onNew,
   onRename,
+  onSignOutRequest,
 }) => {
   const [isEditingName, setIsEditingName] = useState(false);
   const [nameInput, setNameInput] = useState(currentFileName);
@@ -173,7 +175,7 @@ export const TopBar: React.FC<TopBarProps> = ({
         <div style={{ width: '1px', height: '20px', backgroundColor: '#e2e8f0', margin: '0 2px' }} />
 
         <AuthStatus />
-        <GoogleSignInButton />
+        <GoogleSignInButton onSignOutRequest={onSignOutRequest} />
       </div>
     </header>
   );

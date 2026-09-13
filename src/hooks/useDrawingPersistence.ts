@@ -38,6 +38,7 @@ export function useDrawingPersistence({
   const [lastSavedAt, setLastSavedAt] = useState<Date | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [isSaving, setIsSaving] = useState<boolean>(false);
 
   // Generation guard to prevent stale async operations from mutating state
   const storageGenerationRef = useRef<number>(generation);
@@ -73,67 +74,87 @@ export function useDrawingPersistence({
     }
   }, [storage]);
 
+  const activeSavePromiseRef = useRef<Promise<boolean> | null>(null);
+
   // Actual save execution: handles first-save vs update and never silently falls back
-  const executeSave = useCallback(async () => {
-    if (!api) return;
-    if (isSavingRef.current) return;
+  const executeSave = useCallback(async (): Promise<boolean> => {
+    if (!api) return false;
+    if (activeSavePromiseRef.current) {
+      return activeSavePromiseRef.current;
+    }
 
     const opGen = storageGenerationRef.current;
-    isSavingRef.current = true;
+    const savePromise = (async () => {
+      isSavingRef.current = true;
+      setIsSaving(true);
 
-    try {
-      setSaveStatus('saving');
-      setErrorMessage(null);
+      try {
+        setSaveStatus('saving');
+        setErrorMessage(null);
 
-      const elements = api.getSceneElementsIncludingDeleted();
-      const appState = api.getAppState();
-      const binaryFiles = api.getFiles();
+        const elements = api.getSceneElementsIncludingDeleted();
+        const appState = api.getAppState();
+        const binaryFiles = api.getFiles();
 
-      const serialized = serializeDrawing(elements, appState, binaryFiles);
+        const serialized = serializeDrawing(elements, appState, binaryFiles);
 
-      let targetId = currentFileIdRef.current;
-      if (!targetId) {
-        // First save on a new/transient drawing: create exactly once
-        targetId = await storage.create(currentFileName, serialized);
-        if (opGen !== storageGenerationRef.current) {
-          return;
+        let targetId = currentFileIdRef.current;
+        if (!targetId) {
+          // First save on a new/transient drawing: create exactly once
+          targetId = await storage.create(currentFileName, serialized);
+          if (opGen !== storageGenerationRef.current) {
+            return false;
+          }
+
+          currentFileIdRef.current = targetId;
+          setCurrentFileId(targetId);
+          if (storageMode === 'local') {
+            localStorage.setItem(LAST_OPENED_KEY, targetId);
+          }
+        } else {
+          // Subsequent save: update existing file
+          await storage.update(targetId, serialized);
+          if (opGen !== storageGenerationRef.current) {
+            return false;
+          }
         }
 
-        currentFileIdRef.current = targetId;
-        setCurrentFileId(targetId);
-        if (storageMode === 'local') {
-          localStorage.setItem(LAST_OPENED_KEY, targetId);
+        lastSavedContentRef.current = serialized;
+        lastSceneVersionRef.current = getSceneVersion(elements);
+        setLastSavedAt(new Date());
+        setSaveStatus('saved');
+        await refreshFiles();
+        return opGen === storageGenerationRef.current;
+      } catch (err) {
+        if (opGen === storageGenerationRef.current) {
+          console.error('Save failed:', err);
+          setSaveStatus('error');
+          setErrorMessage(err instanceof Error ? err.message : 'Save failed');
         }
-      } else {
-        // Subsequent save: update existing file
-        await storage.update(targetId, serialized);
-        if (opGen !== storageGenerationRef.current) {
-          return;
-        }
+        // Zero silent fallback to LocalStorage! Scene remains in-memory dirty for manual retry.
+        return false;
+      } finally {
+        isSavingRef.current = false;
+        setIsSaving(false);
+        activeSavePromiseRef.current = null;
       }
+    })();
 
-      lastSavedContentRef.current = serialized;
-      lastSceneVersionRef.current = getSceneVersion(elements);
-      setLastSavedAt(new Date());
-      setSaveStatus('saved');
-      await refreshFiles();
-    } catch (err) {
-      if (opGen !== storageGenerationRef.current) {
-        return;
-      }
-      console.error('Save failed:', err);
-      setSaveStatus('error');
-      setErrorMessage(err instanceof Error ? err.message : 'Save failed');
-      // Zero silent fallback to LocalStorage! Scene remains in-memory dirty for manual retry.
-    } finally {
-      isSavingRef.current = false;
-    }
+    activeSavePromiseRef.current = savePromise;
+    return savePromise;
   }, [api, currentFileName, storage, storageMode, refreshFiles]);
 
   const { trigger: triggerDebouncedSave, cancel: cancelDebouncedSave } = useDebouncedSave({
     delayMs: 1500,
-    onSave: executeSave,
+    onSave: async () => {
+      await executeSave();
+    },
   });
+
+  const saveNow = useCallback(async (): Promise<boolean> => {
+    cancelDebouncedSave();
+    return executeSave();
+  }, [cancelDebouncedSave, executeSave]);
 
   // Called by Excalidraw onChange
   const handleCanvasChange = useCallback(
@@ -397,6 +418,11 @@ export function useDrawingPersistence({
     currentFileId,
     currentFileName,
     saveStatus,
+    isDirty: saveStatus === 'dirty',
+    isSaving,
+    isSignOutSafe:
+      storageMode !== 'drive' ||
+      (!isSaving && saveStatus !== 'dirty' && saveStatus !== 'error' && saveStatus !== 'saving'),
     lastSavedAt,
     errorMessage,
     isLoading,
@@ -404,7 +430,8 @@ export function useDrawingPersistence({
     generation,
     activeStorage: storage,
     driveAdapter: selection.driveAdapter,
-    saveNow: executeSave,
+    saveNow,
+    cancelPendingSave: cancelDebouncedSave,
     handleCanvasChange,
     openDrawing,
     createNewDrawing,
