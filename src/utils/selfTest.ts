@@ -5,6 +5,9 @@ import { StorageCoordinator } from '../storage/storageCoordinator';
 import { migrateLocalDrawingsToDrive } from '../storage/migrationService';
 import type { ExcalidrawElement } from '@excalidraw/excalidraw/element/types';
 import type { BinaryFiles } from '@excalidraw/excalidraw/types';
+import React, { useEffect, act } from 'react';
+import { createRoot } from 'react-dom/client';
+import { useDrawingPersistence } from '../hooks/useDrawingPersistence';
 
 export interface TestResult {
   name: string;
@@ -1946,318 +1949,318 @@ export async function runPersistenceSelfTests(): Promise<{ passed: boolean; resu
     }
   });
 
-  // 22. Dirty state switch protection and UnsavedSwitchModal orchestration
-  await record('22. Dirty state switch protection and UnsavedSwitchModal orchestration', async () => {
-    type TestSwitchAction =
-      | { type: 'switch'; targetFileId: string; targetFileName?: string }
-      | { type: 'new' };
+  type TestSwitchAction =
+    | { type: 'switch'; targetFileId: string; targetFileName?: string }
+    | { type: 'new' };
 
-    class UnsavedSwitchOrchestratorHarness {
-      public currentFileId: string | null = 'file_1';
-      public currentFileName: string = 'File 1';
-      public saveStatus: string = 'saved';
-      public isSaving: boolean = false;
-      public isDebouncing: boolean = false;
-      public isDirty: boolean = false;
-      public generation: number = 1;
-      public storageMode: 'local' | 'drive' = 'local';
+  class UnsavedSwitchOrchestratorHarness {
+    public currentFileId: string | null = 'file_1';
+    public currentFileName: string = 'File 1';
+    public saveStatus: string = 'saved';
+    public isSaving: boolean = false;
+    public isDebouncing: boolean = false;
+    public isDirty: boolean = false;
+    public generation: number = 1;
+    public storageMode: 'local' | 'drive' = 'local';
 
-      public pendingAction: TestSwitchAction | null = null;
-      public switchSaveError: string | null = null;
-      public isModalOpen: boolean = false;
+    public pendingAction: TestSwitchAction | null = null;
+    public switchSaveError: string | null = null;
+    public isModalOpen: boolean = false;
 
-      public saveCallCount: number = 0;
-      public mockSaveResult: boolean = true;
-      public saveDelayMs: number = 0;
-      public activeSavePromise: Promise<boolean> | null = null;
-      public cancelledDebouncedSave: boolean = false;
+    public saveCallCount: number = 0;
+    public mockSaveResult: boolean = true;
+    public saveDelayMs: number = 0;
+    public activeSavePromise: Promise<boolean> | null = null;
+    public cancelledDebouncedSave: boolean = false;
 
-      public latestSaveRequestId: number = 0;
-      public activeSaveAbortController: AbortController | null = null;
-      public canvasContent: string = 'content_1_initial';
-      public lastSavedContent: string = 'content_1_initial';
+    public latestSaveRequestId: number = 0;
+    public activeSaveAbortController: AbortController | null = null;
+    public canvasContent: string = 'content_1_initial';
+    public lastSavedContent: string = 'content_1_initial';
 
-      public files: any[] = [
-        { id: 'file_1', name: 'File 1.excalidraw' },
-        { id: 'file_2', name: 'File 2.excalidraw' },
-      ];
+    public files: any[] = [
+      { id: 'file_1', name: 'File 1.excalidraw' },
+      { id: 'file_2', name: 'File 2.excalidraw' },
+    ];
 
-      public mockStorage: {
-        records: Record<string, string>;
-        create: (name: string, content: string, signal?: AbortSignal) => Promise<string>;
-        update: (fileId: string, content: string, signal?: AbortSignal) => Promise<void>;
+    public mockStorage: {
+      records: Record<string, string>;
+      create: (name: string, content: string, signal?: AbortSignal) => Promise<string>;
+      update: (fileId: string, content: string, signal?: AbortSignal) => Promise<void>;
+    };
+
+    constructor(customStorage?: any) {
+      this.mockStorage = customStorage || {
+        records: {
+          file_1: 'content_1_initial',
+          file_2: 'content_2_initial',
+        },
+        create: async (_name: string, content: string, signal?: AbortSignal) => {
+          if (signal?.aborted) throw new Error('Aborted');
+          const id = 'created_' + Date.now();
+          this.mockStorage.records[id] = content;
+          return id;
+        },
+        update: async (fileId: string, content: string, signal?: AbortSignal) => {
+          if (signal?.aborted) throw new Error('Aborted');
+          this.mockStorage.records[fileId] = content;
+        },
       };
+    }
 
-      constructor(customStorage?: any) {
-        this.mockStorage = customStorage || {
-          records: {
-            file_1: 'content_1_initial',
-            file_2: 'content_2_initial',
-          },
-          create: async (_name: string, content: string, signal?: AbortSignal) => {
-            if (signal?.aborted) throw new Error('Aborted');
-            const id = 'created_' + Date.now();
-            this.mockStorage.records[id] = content;
-            return id;
-          },
-          update: async (fileId: string, content: string, signal?: AbortSignal) => {
-            if (signal?.aborted) throw new Error('Aborted');
-            this.mockStorage.records[fileId] = content;
-          },
+    public isSceneUnsaved(): boolean {
+      return (
+        this.isDirty ||
+        this.saveStatus === 'dirty' ||
+        this.saveStatus === 'saving' ||
+        this.saveStatus === 'error' ||
+        this.isSaving ||
+        this.isDebouncing
+      );
+    }
+
+    public handleSelectFileRequest(fileId: string): boolean {
+      if (fileId === this.currentFileId) {
+        // No-op for currently active file
+        return false;
+      }
+
+      if (this.isSceneUnsaved()) {
+        const target = this.files.find((f) => f.id === fileId);
+        this.switchSaveError = null;
+        this.pendingAction = {
+          type: 'switch',
+          targetFileId: fileId,
+          targetFileName: target ? target.name : undefined,
         };
+        this.isModalOpen = true;
+        return false;
+      } else {
+        this.currentFileId = fileId;
+        const target = this.files.find((f) => f.id === fileId);
+        this.currentFileName = target ? target.name : 'Untitled';
+        return true;
+      }
+    }
+
+    public handleNewDrawingRequest(): boolean {
+      if (this.isSceneUnsaved()) {
+        this.switchSaveError = null;
+        this.pendingAction = { type: 'new' };
+        this.isModalOpen = true;
+        return false;
+      } else {
+        this.currentFileId = 'new_id_' + Date.now();
+        this.currentFileName = 'Untitled';
+        this.saveStatus = 'saved';
+        this.isDirty = false;
+        return true;
+      }
+    }
+
+    public cancelPendingSave(): void {
+      this.cancelledDebouncedSave = true;
+      this.isDebouncing = false;
+      this.latestSaveRequestId++;
+      if (this.activeSaveAbortController) {
+        this.activeSaveAbortController.abort();
+        this.activeSaveAbortController = null;
+      }
+      this.activeSavePromise = null;
+      this.isSaving = false;
+    }
+
+    public async saveNow(): Promise<boolean> {
+      if (this.activeSavePromise) {
+        return this.activeSavePromise;
       }
 
-      public isSceneUnsaved(): boolean {
-        return (
-          this.isDirty ||
-          this.saveStatus === 'dirty' ||
-          this.saveStatus === 'saving' ||
-          this.saveStatus === 'error' ||
-          this.isSaving ||
-          this.isDebouncing
-        );
-      }
+      const opGen = this.generation;
+      const saveRequestId = ++this.latestSaveRequestId;
+      const targetFileId = this.currentFileId;
+      const abortController = new AbortController();
+      this.activeSaveAbortController = abortController;
 
-      public handleSelectFileRequest(fileId: string): boolean {
-        if (fileId === this.currentFileId) {
-          // No-op for currently active file
-          return false;
-        }
+      const p = (async () => {
+        this.isSaving = true;
+        this.saveCallCount++;
+        try {
+          this.saveStatus = 'saving';
+          if (this.saveDelayMs > 0) {
+            await new Promise((r) => setTimeout(r, this.saveDelayMs));
+          }
 
-        if (this.isSceneUnsaved()) {
-          const target = this.files.find((f) => f.id === fileId);
-          this.switchSaveError = null;
-          this.pendingAction = {
-            type: 'switch',
-            targetFileId: fileId,
-            targetFileName: target ? target.name : undefined,
-          };
-          this.isModalOpen = true;
-          return false;
-        } else {
-          this.currentFileId = fileId;
-          const target = this.files.find((f) => f.id === fileId);
-          this.currentFileName = target ? target.name : 'Untitled';
-          return true;
-        }
-      }
+          const serialized = this.canvasContent;
+          let targetId = targetFileId;
 
-      public handleNewDrawingRequest(): boolean {
-        if (this.isSceneUnsaved()) {
-          this.switchSaveError = null;
-          this.pendingAction = { type: 'new' };
-          this.isModalOpen = true;
-          return false;
-        } else {
-          this.currentFileId = 'new_id_' + Date.now();
-          this.currentFileName = 'Untitled';
-          this.saveStatus = 'saved';
-          this.isDirty = false;
-          return true;
-        }
-      }
+          if (
+            opGen !== this.generation ||
+            saveRequestId !== this.latestSaveRequestId ||
+            abortController.signal.aborted ||
+            (targetFileId !== null && this.currentFileId !== targetFileId)
+          ) {
+            return false;
+          }
 
-      public cancelPendingSave(): void {
-        this.cancelledDebouncedSave = true;
-        this.isDebouncing = false;
-        this.latestSaveRequestId++;
-        if (this.activeSaveAbortController) {
-          this.activeSaveAbortController.abort();
-          this.activeSaveAbortController = null;
-        }
-        this.activeSavePromise = null;
-        this.isSaving = false;
-      }
-
-      public async saveNow(): Promise<boolean> {
-        if (this.activeSavePromise) {
-          return this.activeSavePromise;
-        }
-
-        const opGen = this.generation;
-        const saveRequestId = ++this.latestSaveRequestId;
-        const targetFileId = this.currentFileId;
-        const abortController = new AbortController();
-        this.activeSaveAbortController = abortController;
-
-        const p = (async () => {
-          this.isSaving = true;
-          this.saveCallCount++;
-          try {
-            this.saveStatus = 'saving';
-            if (this.saveDelayMs > 0) {
-              await new Promise((r) => setTimeout(r, this.saveDelayMs));
-            }
-
-            const serialized = this.canvasContent;
-            let targetId = targetFileId;
-
+          if (!targetId) {
+            targetId = await this.mockStorage.create(this.currentFileName, serialized, abortController.signal);
             if (
               opGen !== this.generation ||
               saveRequestId !== this.latestSaveRequestId ||
               abortController.signal.aborted ||
-              (targetFileId !== null && this.currentFileId !== targetFileId)
+              this.currentFileId !== null
             ) {
               return false;
             }
-
-            if (!targetId) {
-              targetId = await this.mockStorage.create(this.currentFileName, serialized, abortController.signal);
-              if (
-                opGen !== this.generation ||
-                saveRequestId !== this.latestSaveRequestId ||
-                abortController.signal.aborted ||
-                this.currentFileId !== null
-              ) {
-                return false;
-              }
-              this.currentFileId = targetId;
-            } else {
-              await this.mockStorage.update(targetId, serialized, abortController.signal);
-              if (
-                opGen !== this.generation ||
-                saveRequestId !== this.latestSaveRequestId ||
-                abortController.signal.aborted ||
-                this.currentFileId !== targetId
-              ) {
-                return false;
-              }
-            }
-
-            if (!this.mockSaveResult) {
-              throw new Error('Save failed');
-            }
-
-            this.lastSavedContent = serialized;
-            this.saveStatus = 'saved';
-            this.isDirty = false;
-            return (
-              opGen === this.generation &&
-              saveRequestId === this.latestSaveRequestId &&
-              !abortController.signal.aborted
-            );
-          } catch (err: any) {
+            this.currentFileId = targetId;
+          } else {
+            await this.mockStorage.update(targetId, serialized, abortController.signal);
             if (
-              opGen === this.generation &&
-              saveRequestId === this.latestSaveRequestId &&
-              !abortController.signal.aborted &&
-              (targetFileId === null ? this.currentFileId === null : this.currentFileId === targetFileId)
+              opGen !== this.generation ||
+              saveRequestId !== this.latestSaveRequestId ||
+              abortController.signal.aborted ||
+              this.currentFileId !== targetId
             ) {
-              this.saveStatus = 'error';
-              this.switchSaveError = err?.message || 'Save failed';
-            }
-            return false;
-          } finally {
-            if (this.activeSaveAbortController === abortController) {
-              this.activeSaveAbortController = null;
-            }
-            if (
-              opGen === this.generation &&
-              saveRequestId === this.latestSaveRequestId &&
-              !abortController.signal.aborted
-            ) {
-              this.isSaving = false;
-              this.activeSavePromise = null;
-            }
-          }
-        })();
-
-        this.activeSavePromise = p;
-        return p;
-      }
-
-      public activeSwitchPromise: Promise<boolean> | null = null;
-
-      public async handleSaveAndProceed(): Promise<boolean> {
-        if (this.activeSwitchPromise) {
-          return this.activeSwitchPromise;
-        }
-        if (!this.pendingAction) return false;
-        const startGen = this.generation;
-        const action = this.pendingAction;
-        this.switchSaveError = null;
-
-        const p = (async () => {
-          try {
-            const success = await this.saveNow();
-            if (!success || this.generation !== startGen) {
-              this.switchSaveError = 'Failed to save drawing. Active drawing preserved.';
               return false;
             }
-
-            this.pendingAction = null;
-            this.isModalOpen = false;
-
-            if (action.type === 'switch') {
-              this.currentFileId = action.targetFileId;
-              const target = this.files.find((f) => f.id === action.targetFileId);
-              this.currentFileName = target ? target.name : 'Untitled';
-              this.canvasContent = this.mockStorage.records[action.targetFileId] || '';
-              this.lastSavedContent = this.canvasContent;
-            } else {
-              this.currentFileId = 'new_created_id';
-              this.currentFileName = 'Untitled';
-              this.canvasContent = JSON.stringify({ name: 'Untitled', elements: [] });
-              this.lastSavedContent = this.canvasContent;
-            }
-            return true;
-          } catch (err: any) {
-            this.switchSaveError = err?.message || 'Save failed. Active drawing preserved.';
-            return false;
-          } finally {
-            this.activeSwitchPromise = null;
           }
-        })();
 
-        this.activeSwitchPromise = p;
-        return p;
-      }
+          if (!this.mockSaveResult) {
+            throw new Error('Save failed');
+          }
 
-      public handleDiscardAndProceed(): void {
-        if (!this.pendingAction) return;
-        const action = this.pendingAction;
-        this.pendingAction = null;
-        this.isModalOpen = false;
-        this.switchSaveError = null;
-
-        // Invalidate in-flight and debounced saves BEFORE switching files or creating new file
-        this.cancelPendingSave();
-
-        if (action.type === 'switch') {
-          this.currentFileId = action.targetFileId;
-          const target = this.files.find((f) => f.id === action.targetFileId);
-          this.currentFileName = target ? target.name : 'Untitled';
-          this.canvasContent = this.mockStorage.records[action.targetFileId] || '';
-          this.lastSavedContent = this.canvasContent;
+          this.lastSavedContent = serialized;
           this.saveStatus = 'saved';
           this.isDirty = false;
-        } else {
-          this.currentFileId = 'new_created_id';
-          this.currentFileName = 'Untitled';
-          this.canvasContent = JSON.stringify({ name: 'Untitled', elements: [] });
-          this.lastSavedContent = this.canvasContent;
-          this.saveStatus = 'saved';
-          this.isDirty = false;
+          return (
+            opGen === this.generation &&
+            saveRequestId === this.latestSaveRequestId &&
+            !abortController.signal.aborted
+          );
+        } catch (err: any) {
+          if (
+            opGen === this.generation &&
+            saveRequestId === this.latestSaveRequestId &&
+            !abortController.signal.aborted &&
+            (targetFileId === null ? this.currentFileId === null : this.currentFileId === targetFileId)
+          ) {
+            this.saveStatus = 'error';
+            this.switchSaveError = err?.message || 'Save failed';
+          }
+          return false;
+        } finally {
+          if (this.activeSaveAbortController === abortController) {
+            this.activeSaveAbortController = null;
+          }
+          if (
+            opGen === this.generation &&
+            saveRequestId === this.latestSaveRequestId &&
+            !abortController.signal.aborted
+          ) {
+            this.isSaving = false;
+            this.activeSavePromise = null;
+          }
         }
-      }
+      })();
 
-      public handleCancel(): void {
-        this.pendingAction = null;
-        this.isModalOpen = false;
-        this.switchSaveError = null;
-      }
+      this.activeSavePromise = p;
+      return p;
+    }
 
-      public transitionGeneration(newGen: number, newMode: any): void {
-        this.generation = newGen;
-        this.storageMode = newMode;
-        // Invalidate pending switch action
-        this.pendingAction = null;
-        this.switchSaveError = null;
-        this.isModalOpen = false;
-        this.activeSwitchPromise = null;
+    public activeSwitchPromise: Promise<boolean> | null = null;
+
+    public async handleSaveAndProceed(): Promise<boolean> {
+      if (this.activeSwitchPromise) {
+        return this.activeSwitchPromise;
+      }
+      if (!this.pendingAction) return false;
+      const startGen = this.generation;
+      const action = this.pendingAction;
+      this.switchSaveError = null;
+
+      const p = (async () => {
+        try {
+          const success = await this.saveNow();
+          if (!success || this.generation !== startGen) {
+            this.switchSaveError = 'Failed to save drawing. Active drawing preserved.';
+            return false;
+          }
+
+          this.pendingAction = null;
+          this.isModalOpen = false;
+
+          if (action.type === 'switch') {
+            this.currentFileId = action.targetFileId;
+            const target = this.files.find((f) => f.id === action.targetFileId);
+            this.currentFileName = target ? target.name : 'Untitled';
+            this.canvasContent = this.mockStorage.records[action.targetFileId] || '';
+            this.lastSavedContent = this.canvasContent;
+          } else {
+            this.currentFileId = 'new_created_id';
+            this.currentFileName = 'Untitled';
+            this.canvasContent = JSON.stringify({ name: 'Untitled', elements: [] });
+            this.lastSavedContent = this.canvasContent;
+          }
+          return true;
+        } catch (err: any) {
+          this.switchSaveError = err?.message || 'Save failed. Active drawing preserved.';
+          return false;
+        } finally {
+          this.activeSwitchPromise = null;
+        }
+      })();
+
+      this.activeSwitchPromise = p;
+      return p;
+    }
+
+    public handleDiscardAndProceed(): void {
+      if (!this.pendingAction) return;
+      const action = this.pendingAction;
+      this.pendingAction = null;
+      this.isModalOpen = false;
+      this.switchSaveError = null;
+
+      // Invalidate in-flight and debounced saves BEFORE switching files or creating new file
+      this.cancelPendingSave();
+
+      if (action.type === 'switch') {
+        this.currentFileId = action.targetFileId;
+        const target = this.files.find((f) => f.id === action.targetFileId);
+        this.currentFileName = target ? target.name : 'Untitled';
+        this.canvasContent = this.mockStorage.records[action.targetFileId] || '';
+        this.lastSavedContent = this.canvasContent;
+        this.saveStatus = 'saved';
+        this.isDirty = false;
+      } else {
+        this.currentFileId = 'new_created_id';
+        this.currentFileName = 'Untitled';
+        this.canvasContent = JSON.stringify({ name: 'Untitled', elements: [] });
+        this.lastSavedContent = this.canvasContent;
+        this.saveStatus = 'saved';
+        this.isDirty = false;
       }
     }
 
+    public handleCancel(): void {
+      this.pendingAction = null;
+      this.isModalOpen = false;
+      this.switchSaveError = null;
+    }
+
+    public transitionGeneration(newGen: number, newMode: any): void {
+      this.generation = newGen;
+      this.storageMode = newMode;
+      // Invalidate pending switch action
+      this.pendingAction = null;
+      this.switchSaveError = null;
+      this.isModalOpen = false;
+      this.activeSwitchPromise = null;
+    }
+  }
+
+  // 22. Dirty state switch protection and UnsavedSwitchModal orchestration
+  await record('22. Dirty state switch protection and UnsavedSwitchModal orchestration', async () => {
     // A. Clean scene allows immediate file switch without modal
     const harness = new UnsavedSwitchOrchestratorHarness();
     const switched = harness.handleSelectFileRequest('file_2');
@@ -2401,18 +2404,11 @@ export async function runPersistenceSelfTests(): Promise<{ passed: boolean; resu
     if (flightOutcome !== false || harnessGenFlight.currentFileId !== 'file_1') {
       throw new Error('Save across generation transition must not authorize file switch');
     }
+  });
 
-    // N. Deterministic in-flight save invalidation on Discard and Switch
-    // 1. Start with File A loaded.
-    // 2. Modify File A so it is dirty.
-    // 3. Start saveNow() for File A.
-    // 4. Pause/block the mocked underlying Drive save so the promise remains pending.
-    // 5. While that save is pending, trigger Discard and Switch.
-    // 6. The discard operation must invalidate the old save.
-    // 7. Release/resolve the previously pending save promise.
-    // 8. Assert that the old File A scene is NOT persisted by that stale save.
-    // 9. Assert the new navigation/create operation remains valid.
-    // 10. Assert there is no later stale completion that can overwrite the newly selected file/scene.
+  // 23. In-flight save invalidation on Discard — Case A: Abort-aware storage (AbortSignal propagation)
+  await record('23. In-flight save invalidation on Discard — Case A: Abort-aware storage (AbortSignal propagation)', async () => {
+    // Scenario 1: Discard and Switch
     let resolveStorageUpdateA: () => void = () => {};
     let storageUpdateSignal: AbortSignal | undefined;
     const storageMap: Record<string, string> = {
@@ -2422,9 +2418,7 @@ export async function runPersistenceSelfTests(): Promise<{ passed: boolean; resu
 
     const mockRaceStorage = {
       records: storageMap,
-      create: async (_name: string, _content: string) => {
-        return 'created_file';
-      },
+      create: async (_name: string, _content: string) => 'created_file',
       update: async (fileId: string, content: string, signal?: AbortSignal) => {
         storageUpdateSignal = signal;
         if (fileId === 'file_A') {
@@ -2530,7 +2524,7 @@ export async function runPersistenceSelfTests(): Promise<{ passed: boolean; resu
       throw new Error('File A storage was modified during File B operations');
     }
 
-    // O. Deterministic in-flight save invalidation on Discard and Create (+ New)
+    // Scenario 2: Discard and Create (+ New) with abort-aware storage
     let resolveStorageUpdateCreate: () => void = () => {};
     let createStorageSignal: AbortSignal | undefined;
     const storageMapCreate: Record<string, string> = {
@@ -2612,7 +2606,7 @@ export async function runPersistenceSelfTests(): Promise<{ passed: boolean; resu
       throw new Error(`Expected new file saveStatus=saved, got ${harnessRaceCreate.saveStatus}`);
     }
 
-    // P. Deterministic in-flight save on transient/untitled drawing invalidation on Discard
+    // Scenario 3: Deterministic in-flight save on transient/untitled drawing invalidation on Discard
     let resolveStorageCreate: () => void = () => {};
     let transientStorageSignal: AbortSignal | undefined;
     const transientStorageMap: Record<string, string> = {
@@ -2674,6 +2668,337 @@ export async function runPersistenceSelfTests(): Promise<{ passed: boolean; resu
     }
     if (harnessTransient.currentFileId !== 'file_existing') {
       throw new Error('Transient create completion overwrote currentFileId');
+    }
+  });
+
+  // 24. In-flight save invalidation on Discard — Case B: Abort-insensitive storage & state guard proof
+  await record('24. In-flight save invalidation on Discard — Case B: Abort-insensitive storage & state guard proof', async () => {
+    // Proves that even when the underlying storage operation completely IGNORES AbortSignal
+    // (e.g. server committed write before abort arrived, or custom storage ignores abort),
+    // the request identity/generation guards independently prevent stale persistence and state corruption.
+
+    // Scenario B1: Discard and Switch where storage ignores abort and writes anyway
+    let resolveStorageUpdateB1: () => void = () => {};
+    const storageMapB1: Record<string, string> = {
+      file_A: 'scene_A_clean',
+      file_B: 'scene_B_clean',
+    };
+
+    const mockStorageIgnoreAbort = {
+      records: storageMapB1,
+      create: async (_name: string, content: string) => {
+        const id = 'created_' + Date.now();
+        storageMapB1[id] = content;
+        return id;
+      },
+      update: async (fileId: string, content: string, _signal?: AbortSignal) => {
+        if (fileId === 'file_A') {
+          // Pause in flight
+          await new Promise<void>((resolve) => {
+            resolveStorageUpdateB1 = resolve;
+          });
+          // DELIBERATELY IGNORE signal.aborted and commit write to simulate remote server completion!
+        }
+        storageMapB1[fileId] = content;
+      },
+    };
+
+    const harnessB1 = new UnsavedSwitchOrchestratorHarness(mockStorageIgnoreAbort);
+    harnessB1.files = [
+      { id: 'file_A', name: 'Drawing A.excalidraw' },
+      { id: 'file_B', name: 'Drawing B.excalidraw' },
+    ];
+    harnessB1.currentFileId = 'file_A';
+    harnessB1.currentFileName = 'Drawing A';
+    harnessB1.canvasContent = 'scene_A_clean';
+    harnessB1.lastSavedContent = 'scene_A_clean';
+    harnessB1.saveStatus = 'saved';
+
+    // Step 1: Modify File A to dirty
+    harnessB1.canvasContent = 'scene_A_DIRTY_DISCARDED';
+    harnessB1.isDirty = true;
+    harnessB1.saveStatus = 'dirty';
+
+    // Step 2: Start saveNow() in flight
+    const pendingSaveB1 = harnessB1.saveNow();
+    if (!harnessB1.isSaving) throw new Error('Save should be in-flight');
+
+    // Step 3: While in flight, user discards and switches to File B
+    harnessB1.handleSelectFileRequest('file_B');
+    harnessB1.handleDiscardAndProceed();
+
+    // Verify File B is active
+    if (harnessB1.currentFileId !== 'file_B') throw new Error('File B should be active');
+    if (harnessB1.canvasContent !== 'scene_B_clean') throw new Error('Canvas should be scene_B_clean');
+
+    // Step 4: Storage resolves successfully (ignoring abort)
+    resolveStorageUpdateB1();
+    const outcomeB1 = await pendingSaveB1;
+
+    // Requirement Assertions for Case B:
+    // 1. Stale save must return false
+    if (outcomeB1 !== false) {
+      throw new Error('Stale save must return false even when storage write resolves successfully');
+    }
+    // 2. Stale completion must not mutate currentFileId away from File B
+    if (harnessB1.currentFileId !== 'file_B') {
+      throw new Error(`CRITICAL: Stale save completion corrupted currentFileId to ${harnessB1.currentFileId}`);
+    }
+    // 3. Stale completion must not overwrite File B canvas
+    if (harnessB1.canvasContent !== 'scene_B_clean') {
+      throw new Error(`CRITICAL: Stale save completion corrupted File B canvas to ${harnessB1.canvasContent}`);
+    }
+    // 4. Stale completion must not update lastSavedContent to discarded content
+    if (harnessB1.lastSavedContent !== 'scene_B_clean') {
+      throw new Error(`CRITICAL: Stale save updated lastSavedContent to ${harnessB1.lastSavedContent}`);
+    }
+    // 5. Stale completion must not clear dirty state
+    if (harnessB1.saveStatus !== 'saved') {
+      throw new Error(`Expected saveStatus=saved, got ${harnessB1.saveStatus}`);
+    }
+    // 6. Stale completion must not leave isSaving true
+    if (harnessB1.isSaving) {
+      throw new Error('isSaving should be false');
+    }
+
+    // Scenario B2: Stale completion must NOT clear/overwrite dirty state of newly active File B
+    let resolveStorageUpdateB2: () => void = () => {};
+    const storageMapB2: Record<string, string> = {
+      file_A: 'scene_A_clean',
+      file_B: 'scene_B_clean',
+    };
+
+    const mockStorageB2 = {
+      records: storageMapB2,
+      create: async (_name: string, _content: string) => 'id',
+      update: async (fileId: string, content: string, _signal?: AbortSignal) => {
+        if (fileId === 'file_A') {
+          await new Promise<void>((r) => { resolveStorageUpdateB2 = r; });
+        }
+        storageMapB2[fileId] = content;
+      },
+    };
+
+    const harnessB2 = new UnsavedSwitchOrchestratorHarness(mockStorageB2);
+    harnessB2.currentFileId = 'file_A';
+    harnessB2.canvasContent = 'scene_A_DIRTY';
+    harnessB2.isDirty = true;
+    harnessB2.saveStatus = 'dirty';
+
+    // Start File A save
+    const pSaveB2 = harnessB2.saveNow();
+
+    // User discards and switches to File B
+    harnessB2.handleSelectFileRequest('file_B');
+    harnessB2.handleDiscardAndProceed();
+
+    // User now makes changes to File B -> File B is now DIRTY!
+    harnessB2.canvasContent = 'scene_B_MODIFIED_UNSAVED';
+    harnessB2.isDirty = true;
+    harnessB2.saveStatus = 'dirty';
+
+    // NOW the stale File A save resolves
+    resolveStorageUpdateB2();
+    const resB2 = await pSaveB2;
+    if (resB2 !== false) throw new Error('Stale save must return false');
+
+    // CRITICAL: File B's dirty state must NOT be wiped out by File A's stale completion!
+    if (harnessB2.saveStatus !== 'dirty') {
+      throw new Error(`CRITICAL DATA LOSS RISK: Stale completion wiped out File B dirty status! saveStatus=${harnessB2.saveStatus}`);
+    }
+    if (!harnessB2.isDirty) {
+      throw new Error('CRITICAL: Stale completion set isDirty=false for new file');
+    }
+    if (harnessB2.canvasContent !== 'scene_B_MODIFIED_UNSAVED') {
+      throw new Error('CRITICAL: Canvas content was mutated by stale completion');
+    }
+    if (harnessB2.currentFileId !== 'file_B') {
+      throw new Error('CRITICAL: currentFileId was mutated away from file_B');
+    }
+
+    // Scenario B3: Transient drawing creation ignores abort and assigns ID
+    let resolveStorageCreateB3: () => void = () => {};
+    const storageMapB3: Record<string, string> = {
+      file_existing: 'existing_content',
+    };
+
+    const mockStorageB3 = {
+      records: storageMapB3,
+      create: async (_name: string, content: string, _signal?: AbortSignal) => {
+        await new Promise<void>((r) => { resolveStorageCreateB3 = r; });
+        const id = 'stale_transient_assigned_id';
+        storageMapB3[id] = content;
+        return id;
+      },
+      update: async (fileId: string, content: string) => {
+        storageMapB3[fileId] = content;
+      },
+    };
+
+    const harnessB3 = new UnsavedSwitchOrchestratorHarness(mockStorageB3);
+    harnessB3.currentFileId = null; // Transient drawing
+    harnessB3.currentFileName = 'Untitled';
+    harnessB3.canvasContent = 'transient_content';
+    harnessB3.isDirty = true;
+    harnessB3.saveStatus = 'dirty';
+
+    // Start save of transient drawing
+    const pSaveB3 = harnessB3.saveNow();
+
+    // User discards transient drawing and opens file_existing
+    harnessB3.handleSelectFileRequest('file_existing');
+    harnessB3.handleDiscardAndProceed();
+
+    if (harnessB3.currentFileId !== 'file_existing') {
+      throw new Error('Current file should be file_existing');
+    }
+
+    // Stale create resolves and returns an ID
+    resolveStorageCreateB3();
+    const resB3 = await pSaveB3;
+
+    if (resB3 !== false) throw new Error('Stale transient save must return false');
+    // CRITICAL: Stale create completion must NOT hijack currentFileId away from file_existing
+    if (harnessB3.currentFileId !== 'file_existing') {
+      throw new Error(`CRITICAL: Stale create completion hijacked currentFileId to ${harnessB3.currentFileId}`);
+    }
+  });
+
+  // 25. Production useDrawingPersistence hook: deterministic in-flight save abort and stale guard verification
+  await record('25. Production useDrawingPersistence hook: deterministic in-flight save abort and stale guard verification', async () => {
+    const hookHolder: { current: ReturnType<typeof useDrawingPersistence> | null } = { current: null };
+    let resolveHookReady: () => void = () => {};
+    const hookReadyPromise = new Promise<void>((r) => {
+      resolveHookReady = r;
+    });
+
+    let resolveStorageUpdate: () => void = () => {};
+    let storageSignal: AbortSignal | undefined;
+    const testStorageMap: Record<string, string> = {
+      file_A: JSON.stringify({ name: 'Drawing A', elements: [{ id: '1', type: 'rectangle' }] }),
+      file_B: JSON.stringify({ name: 'Drawing B', elements: [{ id: '2', type: 'ellipse' }] }),
+    };
+
+    const mockProductionStorage: any = {
+      list: async () => [
+        { id: 'file_A', name: 'Drawing A.excalidraw' },
+        { id: 'file_B', name: 'Drawing B.excalidraw' },
+      ],
+      get: async (id: string) => testStorageMap[id] || '',
+      create: async (_name: string, content: string, signal?: AbortSignal) => {
+        if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+        const id = 'created_' + Date.now();
+        testStorageMap[id] = content;
+        return id;
+      },
+      update: async (fileId: string, content: string, signal?: AbortSignal) => {
+        storageSignal = signal;
+        if (fileId === 'file_A') {
+          await new Promise<void>((r) => {
+            resolveStorageUpdate = r;
+          });
+          if (signal?.aborted) {
+            throw new DOMException('The user aborted a request.', 'AbortError');
+          }
+        }
+        testStorageMap[fileId] = content;
+      },
+    };
+
+    const mockExcalidrawApi: any = {
+      getSceneElementsIncludingDeleted: () => [{ id: '1', type: 'rectangle', version: 2 }],
+      getAppState: () => ({ viewBackgroundColor: '#ffffff' }),
+      getFiles: () => ({}),
+      updateScene: () => {},
+      resetScene: () => {},
+      history: { clear: () => {} },
+    };
+
+    function TestPersistenceComponent() {
+      const hook = useDrawingPersistence({
+        api: mockExcalidrawApi,
+        storage: mockProductionStorage,
+      });
+      useEffect(() => {
+        hookHolder.current = hook;
+        if (hook.currentFileId === 'file_A' && !hook.isLoading) {
+          resolveHookReady();
+        }
+      });
+      return null;
+    }
+
+    // Ensure clean local storage state for test
+    localStorage.removeItem('canvasvault_last_opened_id');
+
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => {
+        root.render(React.createElement(TestPersistenceComponent));
+      });
+
+      await hookReadyPromise;
+
+      if (!hookHolder.current) throw new Error('Production hook was not mounted');
+      if ((hookHolder.current.currentFileId as string | null) !== 'file_A') {
+        throw new Error(`Expected initial file to be file_A, got ${hookHolder.current.currentFileId}`);
+      }
+
+      // Step 1: Start saveNow() on File A using the REAL production hook
+      let saveOutcome: boolean | null = null;
+      let savePromise!: Promise<boolean>;
+      await act(async () => {
+        savePromise = hookHolder.current!.saveNow();
+      });
+
+      // Storage update for file_A is now in flight
+      if (!hookHolder.current.isSaving) {
+        throw new Error('Production hook isSaving should be true while save is in flight');
+      }
+
+      // Step 2: Trigger Discard and Switch to File B using production hook functions
+      await act(async () => {
+        // Discard cancels pending saves
+        hookHolder.current!.cancelPendingSave();
+        // Load File B
+        await hookHolder.current!.openDrawing('file_B');
+      });
+
+      // Assert that AbortSignal was aborted
+      if (!storageSignal?.aborted) {
+        throw new Error('Production hook cancelPendingSave() did not abort the active AbortController');
+      }
+      if ((hookHolder.current.currentFileId as string | null) !== 'file_B') {
+        throw new Error(`Production hook active file should be file_B, got ${hookHolder.current.currentFileId}`);
+      }
+
+      // Step 3: Release the in-flight save promise
+      await act(async () => {
+        resolveStorageUpdate();
+        saveOutcome = await savePromise;
+      });
+
+      // Step 4: Verify production hook behavior
+      if (saveOutcome !== false) {
+        throw new Error('Production hook saveNow() should have returned false after invalidation');
+      }
+      if ((hookHolder.current.currentFileId as string | null) !== 'file_B') {
+        throw new Error('Stale save completion mutated production currentFileId away from file_B');
+      }
+      if (hookHolder.current.saveStatus !== 'saved') {
+        throw new Error(`Expected production saveStatus=saved for file_B, got ${hookHolder.current.saveStatus}`);
+      }
+      if (hookHolder.current.isSaving) {
+        throw new Error('Production isSaving should be false');
+      }
+    } finally {
+      await act(async () => {
+        root.unmount();
+      });
+      container.remove();
     }
   });
 
