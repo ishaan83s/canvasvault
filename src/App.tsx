@@ -5,9 +5,10 @@ import { TopBar } from './components/TopBar';
 import { FileSidebar } from './components/FileSidebar';
 import { testLocalStorageAdapter } from './storage/localStorageAdapter';
 import { useDrawingPersistence } from './hooks/useDrawingPersistence';
+import { AuthProvider } from './auth/AuthProvider';
 import './App.css';
 
-function App() {
+function MainLayout() {
   const [excalidrawAPI, setExcalidrawAPI] = useState<ExcalidrawImperativeAPI | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(true);
 
@@ -68,6 +69,14 @@ function App() {
         </main>
       </div>
     </div>
+  );
+}
+
+function App() {
+  return (
+    <AuthProvider>
+      <MainLayout />
+    </AuthProvider>
   );
 }
 

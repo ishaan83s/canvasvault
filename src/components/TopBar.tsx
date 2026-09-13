@@ -1,5 +1,7 @@
 import React, { useState } from 'react';
 import { SaveStatus } from './SaveStatus';
+import { GoogleSignInButton } from './GoogleSignInButton';
+import { AuthStatus } from './AuthStatus';
 import type { SaveStatus as StatusType } from '../storage/types';
 
 interface TopBarProps {
@@ -133,7 +135,7 @@ export const TopBar: React.FC<TopBarProps> = ({
         </div>
       </div>
 
-      <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
         <SaveStatus status={saveStatus} lastSavedAt={lastSavedAt} onRetry={onSave} />
 
         <button
@@ -167,6 +169,11 @@ export const TopBar: React.FC<TopBarProps> = ({
         >
           Save
         </button>
+
+        <div style={{ width: '1px', height: '20px', backgroundColor: '#e2e8f0', margin: '0 2px' }} />
+
+        <AuthStatus />
+        <GoogleSignInButton />
       </div>
     </header>
   );
