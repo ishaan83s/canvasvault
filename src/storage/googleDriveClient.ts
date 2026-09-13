@@ -94,10 +94,6 @@ export class GoogleDriveClient {
     }
 
     if (!response.ok) {
-      // Invalidate folder cache ONLY on 404 (folder or file missing)
-      if (response.status === 404) {
-        this.cachedFolderId = null;
-      }
       throw createGoogleDriveErrorFromStatus(response.status, response.statusText);
     }
 
@@ -286,16 +282,24 @@ export class GoogleDriveClient {
       `${content}\r\n` +
       `--${boundary}--`;
 
-    const response = await this.authenticatedFetch(
-      'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': `multipart/related; boundary=${boundary}`,
-        },
-        body: multipartBody,
+    let response: Response;
+    try {
+      response = await this.authenticatedFetch(
+        'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': `multipart/related; boundary=${boundary}`,
+          },
+          body: multipartBody,
+        }
+      );
+    } catch (err) {
+      if (err instanceof GoogleDriveError && err.code === 'NOT_FOUND') {
+        this.invalidateFolderCache();
       }
-    );
+      throw err;
+    }
 
     let data: DriveFileMetadata;
     try {
@@ -366,9 +370,17 @@ export class GoogleDriveClient {
       pageSize: '100',
     });
 
-    const response = await this.authenticatedFetch(
-      `https://www.googleapis.com/drive/v3/files?${params.toString()}`
-    );
+    let response: Response;
+    try {
+      response = await this.authenticatedFetch(
+        `https://www.googleapis.com/drive/v3/files?${params.toString()}`
+      );
+    } catch (err) {
+      if (err instanceof GoogleDriveError && err.code === 'NOT_FOUND') {
+        this.invalidateFolderCache();
+      }
+      throw err;
+    }
 
     let data: { files?: DriveFileMetadata[] };
     try {
@@ -415,9 +427,17 @@ export class GoogleDriveClient {
   }
 
   /**
-   * Manually invalidates cached folder ID (e.g. for testing or reset).
+   * Invalidates the in-memory cached folder ID so the next folder resolution
+   * discovers or recreates the managed CanvasVault folder.
+   */
+  invalidateFolderCache(): void {
+    this.cachedFolderId = null;
+  }
+
+  /**
+   * Alias for backwards compatibility and explicit reset.
    */
   clearCachedFolderId(): void {
-    this.cachedFolderId = null;
+    this.invalidateFolderCache();
   }
 }

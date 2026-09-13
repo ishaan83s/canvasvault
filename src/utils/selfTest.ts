@@ -278,21 +278,28 @@ export async function runPersistenceSelfTests(): Promise<{ passed: boolean; resu
     }
   });
 
-  // 9. Folder cache invalidation on 404 vs preservation on 403/429/500
+  // 9. Folder cache invalidation policy: drawing file 404 preserves cache, folder 404 invalidates
   const { GoogleDriveError } = await import('../storage/googleDriveErrors');
   await record('9. Google Drive: Folder cache invalidation policy', async () => {
     let folderLookups: number = 0;
 
     const mockFetch = createMockFetch((url, init) => {
+      // Folder query
       if (url.includes('/drive/v3/files?') && (!init || !init.method || init.method === 'GET')) {
         folderLookups++;
         return jsonResponse(200, { files: [{ id: 'folder_resilient' }] });
       }
-      if (url.includes('/test-403')) {
-        return jsonResponse(403, { error: 'forbidden' });
+      // Missing drawing file lookup (404)
+      if (url.includes('/files/missing_drawing_id')) {
+        return jsonResponse(404, { error: { message: 'File not found' } });
       }
-      if (url.includes('/test-404')) {
-        return jsonResponse(404, { error: 'not_found' });
+      // Drawing file with 403 forbidden
+      if (url.includes('/files/forbidden_drawing_id')) {
+        return jsonResponse(403, { error: { message: 'Forbidden' } });
+      }
+      // Folder creation endpoint that returns 404 (e.g. parent folder deleted in Drive)
+      if (url.includes('/upload/drive/v3/files?uploadType=multipart')) {
+        return jsonResponse(404, { error: { message: 'Parent folder not found' } });
       }
       return jsonResponse(200, {});
     });
@@ -303,30 +310,65 @@ export async function runPersistenceSelfTests(): Promise<{ passed: boolean; resu
     });
 
     // 1st lookup: discovers folder
-    await client.getOrCreateFolder();
+    const initialFolder = await client.getOrCreateFolder();
+    if (initialFolder !== 'folder_resilient') throw new Error('Failed initial folder discovery');
     if ((folderLookups as number) !== 1) throw new Error(`Expected 1 lookup, got ${folderLookups}`);
 
-    // 2nd lookup: cache hit
+    // 2nd lookup: cache hit, no network discovery
     await client.getOrCreateFolder();
     if ((folderLookups as number) !== 1) throw new Error(`Cache hit failed, lookup count is ${folderLookups}`);
 
-    // 403 error: should NOT invalidate cache
+    // Step A: A 404 on a DRAWING FILE must NOT clear cachedFolderId
+    let drawingCaught = false;
     try {
-      await (client as any).authenticatedFetch('https://example.com/test-403');
-    } catch {
-      // Expected
+      await client.validateManagedFile('missing_drawing_id');
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('Drawing not found')) {
+        drawingCaught = true;
+      }
     }
-    await client.getOrCreateFolder();
-    if ((folderLookups as number) !== 1) throw new Error(`403 should not invalidate folder cache`);
+    if (!drawingCaught) throw new Error('Expected Drawing not found error for missing file');
 
-    // 404 error: SHOULD invalidate cache
+    // Subsequent operation must NOT rediscover the folder
+    await client.getOrCreateFolder();
+    if ((folderLookups as number) !== 1) {
+      throw new Error(`Drawing file 404 improperly invalidated folder cache! Lookup count: ${folderLookups}`);
+    }
+
+    // Step B: A 403 on drawing file must NOT clear cachedFolderId
     try {
-      await (client as any).authenticatedFetch('https://example.com/test-404');
+      await client.validateManagedFile('forbidden_drawing_id');
     } catch {
       // Expected
     }
     await client.getOrCreateFolder();
-    if ((folderLookups as number) !== 2) throw new Error(`404 should have invalidated folder cache`);
+    if ((folderLookups as number) !== 1) {
+      throw new Error(`Drawing file 403 improperly invalidated folder cache! Lookup count: ${folderLookups}`);
+    }
+
+    // Step C: Folder-specific 404 (parent folder missing during multipart upload) SHOULD invalidate cache
+    let uploadCaught = false;
+    try {
+      await client.createMultipartFile('Test.excalidraw', serializedJson);
+    } catch (err) {
+      if (err instanceof GoogleDriveError && err.code === 'NOT_FOUND') {
+        uploadCaught = true;
+      }
+    }
+    if (!uploadCaught) throw new Error('Expected 404 NOT_FOUND on upload failure');
+
+    // Next getOrCreateFolder must now re-discover the folder
+    await client.getOrCreateFolder();
+    if ((folderLookups as number) !== 2) {
+      throw new Error(`Folder-specific 404 failed to invalidate folder cache! Lookup count: ${folderLookups}`);
+    }
+
+    // Step D: Explicit invalidateFolderCache works
+    client.invalidateFolderCache();
+    await client.getOrCreateFolder();
+    if ((folderLookups as number) !== 3) {
+      throw new Error(`invalidateFolderCache failed! Lookup count: ${folderLookups}`);
+    }
   });
 
   // 10. Multipart upload on create()
