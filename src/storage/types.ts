@@ -4,11 +4,12 @@ export interface DrawingFile {
   createdAt: string; // ISO timestamp
   updatedAt: string; // ISO timestamp
   size?: number; // size in bytes
+  appProperties?: Record<string, string>;
 }
 
 export interface DrawingStorage {
-  create(name: string, content: string): Promise<string>;
-  update(fileId: string, content: string): Promise<void>;
+  create(name: string, content: string, signal?: AbortSignal): Promise<string>;
+  update(fileId: string, content: string, signal?: AbortSignal): Promise<void>;
   get(fileId: string): Promise<string>;
   list(): Promise<DrawingFile[]>;
   rename(fileId: string, name: string): Promise<void>;
@@ -16,3 +17,5 @@ export interface DrawingStorage {
 }
 
 export type SaveStatus = 'saved' | 'saving' | 'dirty' | 'error';
+
+export type { StorageMode, AuthMode } from './storageMode';

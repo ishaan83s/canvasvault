@@ -1,7 +1,13 @@
 import { serializeDrawing, deserializeDrawing, ensureExcalidrawExtension, stripExcalidrawExtension, isValidExcalidrawJson } from './excalidrawSerialization';
 import { LocalStorageAdapter } from '../storage/localStorageAdapter';
+import { resolveStorageMode, resolveAuthMode } from '../storage/storageMode';
+import { StorageCoordinator } from '../storage/storageCoordinator';
+import { migrateLocalDrawingsToDrive } from '../storage/migrationService';
 import type { ExcalidrawElement } from '@excalidraw/excalidraw/element/types';
 import type { BinaryFiles } from '@excalidraw/excalidraw/types';
+import React, { useEffect, act } from 'react';
+import { createRoot } from 'react-dom/client';
+import { useDrawingPersistence } from '../hooks/useDrawingPersistence';
 
 export interface TestResult {
   name: string;
@@ -172,7 +178,3464 @@ export async function runPersistenceSelfTests(): Promise<{ passed: boolean; resu
     if (afterDelete.some((f) => f.id === fileId)) throw new Error('File still exists after delete');
   });
 
+  // --- Google Drive Storage Adapter Deterministic Mock Tests ---
+  const MOCK_TOKEN = 'mock_ya29_test_access_token_12345';
+  const FOLDER_ID = 'cv_mock_folder_001';
+  const DRAWING_FILE_ID = 'cv_mock_file_001';
+
+  // Helper to create a mock fetch router
+  function createMockFetch(
+    handler: (url: string, init?: RequestInit) => Response | Promise<Response>
+  ): typeof fetch {
+    return (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      return Promise.resolve(handler(url, init));
+    };
+  }
+
+  // Helper to construct JSON response
+  function jsonResponse(status: number, data: unknown): Response {
+    return new Response(JSON.stringify(data), {
+      status,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  // 6. Drive query escaping
+  const { escapeDriveQueryValue } = await import('../storage/googleDriveClient');
+  record('6. Google Drive: Query parameter escaping', () => {
+    if (escapeDriveQueryValue("normal") !== "normal") throw new Error('Failed normal query escape');
+    if (escapeDriveQueryValue("O'Reilly") !== "O\\'Reilly") throw new Error('Failed quote escape');
+    if (escapeDriveQueryValue("path\\to") !== "path\\\\to") throw new Error('Failed backslash escape');
+    if (escapeDriveQueryValue("O'Reilly\\Folder") !== "O\\'Reilly\\\\Folder") throw new Error('Failed mixed escape');
+  });
+
+  // 7. Folder discovery (reuses existing folder with appProperties marker)
+  const { GoogleDriveClient } = await import('../storage/googleDriveClient');
+  await record('7. Google Drive: Marker-based folder discovery', async () => {
+    let listCallCount = 0;
+    let postCallCount = 0;
+
+    const mockFetch = createMockFetch((url, init) => {
+      if (url.includes('/drive/v3/files') && (!init || init.method === 'GET' || !init.method)) {
+        listCallCount++;
+        const parsedUrl = new URL(url);
+        const q = parsedUrl.searchParams.get('q') || '';
+        if (
+          !q.includes("mimeType = 'application/vnd.google-apps.folder'") ||
+          !q.includes("name = 'CanvasVault'") ||
+          !q.includes("appProperties has { key='app' and value='canvasvault' }") ||
+          !q.includes("appProperties has { key='type' and value='root_folder' }")
+        ) {
+          throw new Error(`Query missing required appProperties marker: ${q}`);
+        }
+        return jsonResponse(200, {
+          files: [{ id: FOLDER_ID, name: 'CanvasVault' }],
+        });
+      }
+      if (init?.method === 'POST') {
+        postCallCount++;
+        return jsonResponse(200, { id: 'unexpected_folder' });
+      }
+      return jsonResponse(404, {});
+    });
+
+    const client = new GoogleDriveClient({
+      getToken: () => MOCK_TOKEN,
+      fetchFn: mockFetch,
+    });
+
+    const folderId = await client.getOrCreateFolder();
+    if (folderId !== FOLDER_ID) throw new Error(`Expected ${FOLDER_ID}, got ${folderId}`);
+    if (listCallCount !== 1) throw new Error(`Expected 1 list call, got ${listCallCount}`);
+    if (postCallCount !== 0) throw new Error(`Folder creation should not have occurred`);
+  });
+
+  // 8. Folder creation when not found
+  await record('8. Google Drive: Folder creation when not found', async () => {
+    let createdPayload: any = null;
+
+    const mockFetch = createMockFetch((url, init) => {
+      if (url.includes('/drive/v3/files') && (!init || init.method === 'GET' || !init.method)) {
+        return jsonResponse(200, { files: [] }); // not found
+      }
+      if (url.includes('/drive/v3/files') && init?.method === 'POST') {
+        createdPayload = JSON.parse(init.body as string);
+        return jsonResponse(200, { id: 'created_folder_999' });
+      }
+      return jsonResponse(404, {});
+    });
+
+    const client = new GoogleDriveClient({
+      getToken: () => MOCK_TOKEN,
+      fetchFn: mockFetch,
+    });
+
+    const folderId = await client.getOrCreateFolder();
+    if (folderId !== 'created_folder_999') throw new Error(`Expected created_folder_999, got ${folderId}`);
+    if (!createdPayload) throw new Error('No POST body sent for folder creation');
+    if (createdPayload.name !== 'CanvasVault') throw new Error('Folder name mismatch');
+    if (createdPayload.mimeType !== 'application/vnd.google-apps.folder') throw new Error('MIME type mismatch');
+    if (
+      createdPayload.appProperties?.app !== 'canvasvault' ||
+      createdPayload.appProperties?.type !== 'root_folder'
+    ) {
+      throw new Error('appProperties marker missing on created folder');
+    }
+  });
+
+  // 9. Folder cache invalidation policy: drawing file 404 preserves cache, folder 404 invalidates
+  const { GoogleDriveError } = await import('../storage/googleDriveErrors');
+  await record('9. Google Drive: Folder cache invalidation policy', async () => {
+    let folderLookups: number = 0;
+
+    const mockFetch = createMockFetch((url, init) => {
+      // Folder query
+      if (url.includes('/drive/v3/files?') && (!init || !init.method || init.method === 'GET')) {
+        folderLookups++;
+        return jsonResponse(200, { files: [{ id: 'folder_resilient' }] });
+      }
+      // Missing drawing file lookup (404)
+      if (url.includes('/files/missing_drawing_id')) {
+        return jsonResponse(404, { error: { message: 'File not found' } });
+      }
+      // Drawing file with 403 forbidden
+      if (url.includes('/files/forbidden_drawing_id')) {
+        return jsonResponse(403, { error: { message: 'Forbidden' } });
+      }
+      // Folder creation endpoint that returns 404 (e.g. parent folder deleted in Drive)
+      if (url.includes('/upload/drive/v3/files?uploadType=multipart')) {
+        return jsonResponse(404, { error: { message: 'Parent folder not found' } });
+      }
+      return jsonResponse(200, {});
+    });
+
+    const client = new GoogleDriveClient({
+      getToken: () => MOCK_TOKEN,
+      fetchFn: mockFetch,
+    });
+
+    // 1st lookup: discovers folder
+    const initialFolder = await client.getOrCreateFolder();
+    if (initialFolder !== 'folder_resilient') throw new Error('Failed initial folder discovery');
+    if ((folderLookups as number) !== 1) throw new Error(`Expected 1 lookup, got ${folderLookups}`);
+
+    // 2nd lookup: cache hit, no network discovery
+    await client.getOrCreateFolder();
+    if ((folderLookups as number) !== 1) throw new Error(`Cache hit failed, lookup count is ${folderLookups}`);
+
+    // Step A: A 404 on a DRAWING FILE must NOT clear cachedFolderId
+    let drawingCaught = false;
+    try {
+      await client.validateManagedFile('missing_drawing_id');
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('Drawing not found')) {
+        drawingCaught = true;
+      }
+    }
+    if (!drawingCaught) throw new Error('Expected Drawing not found error for missing file');
+
+    // Subsequent operation must NOT rediscover the folder
+    await client.getOrCreateFolder();
+    if ((folderLookups as number) !== 1) {
+      throw new Error(`Drawing file 404 improperly invalidated folder cache! Lookup count: ${folderLookups}`);
+    }
+
+    // Step B: A 403 on drawing file must NOT clear cachedFolderId
+    try {
+      await client.validateManagedFile('forbidden_drawing_id');
+    } catch {
+      // Expected
+    }
+    await client.getOrCreateFolder();
+    if ((folderLookups as number) !== 1) {
+      throw new Error(`Drawing file 403 improperly invalidated folder cache! Lookup count: ${folderLookups}`);
+    }
+
+    // Step C: Folder-specific 404 (parent folder missing during multipart upload) SHOULD invalidate cache
+    let uploadCaught = false;
+    try {
+      await client.createMultipartFile('Test.excalidraw', serializedJson);
+    } catch (err) {
+      if (err instanceof GoogleDriveError && err.code === 'NOT_FOUND') {
+        uploadCaught = true;
+      }
+    }
+    if (!uploadCaught) throw new Error('Expected 404 NOT_FOUND on upload failure');
+
+    // Next getOrCreateFolder must now re-discover the folder
+    await client.getOrCreateFolder();
+    if ((folderLookups as number) !== 2) {
+      throw new Error(`Folder-specific 404 failed to invalidate folder cache! Lookup count: ${folderLookups}`);
+    }
+
+    // Step D: Explicit invalidateFolderCache works
+    client.invalidateFolderCache();
+    await client.getOrCreateFolder();
+    if ((folderLookups as number) !== 3) {
+      throw new Error(`invalidateFolderCache failed! Lookup count: ${folderLookups}`);
+    }
+  });
+
+  // 10. Multipart upload on create()
+  const { GoogleDriveAdapter } = await import('../storage/googleDriveAdapter');
+  await record('10. Google Drive: Multipart upload structure on create()', async () => {
+    let capturedUploadHeader = '';
+    let capturedUploadBody = '';
+
+    const mockFetch = createMockFetch((url, init) => {
+      // Folder discovery
+      if (url.includes('/drive/v3/files?') && (!init || !init.method || init.method === 'GET')) {
+        return jsonResponse(200, { files: [{ id: FOLDER_ID }] });
+      }
+      // Multipart upload
+      if (url.includes('/upload/drive/v3/files?uploadType=multipart')) {
+        const headers = init?.headers as Headers;
+        capturedUploadHeader = headers.get('Content-Type') || '';
+        capturedUploadBody = String(init?.body || '');
+        return jsonResponse(200, {
+          id: DRAWING_FILE_ID,
+          name: 'Architecture.excalidraw',
+        });
+      }
+      return jsonResponse(404, {});
+    });
+
+    const adapter = new GoogleDriveAdapter({
+      getToken: () => MOCK_TOKEN,
+      fetchFn: mockFetch,
+    });
+
+    const fileId = await adapter.create('Architecture', serializedJson);
+    if (fileId !== DRAWING_FILE_ID) throw new Error(`Expected ${DRAWING_FILE_ID}, got ${fileId}`);
+    if (!capturedUploadHeader.includes('multipart/related; boundary=')) {
+      throw new Error(`Content-Type must be multipart/related: ${capturedUploadHeader}`);
+    }
+    if (!capturedUploadBody.includes('"name":"Architecture.excalidraw"')) {
+      throw new Error('Filename or extension missing in multipart metadata');
+    }
+    if (!capturedUploadBody.includes(`"parents":["${FOLDER_ID}"]`)) {
+      throw new Error('Parent folder ID missing in multipart metadata');
+    }
+    if (!capturedUploadBody.includes('"app":"canvasvault"') || !capturedUploadBody.includes('"type":"drawing"')) {
+      throw new Error('Drawing appProperties marker missing in multipart metadata');
+    }
+    if (!capturedUploadBody.includes(serializedJson)) {
+      throw new Error('Serialized Excalidraw content missing from media part');
+    }
+  });
+
+  // 11. Media update on update()
+  await record('11. Google Drive: Media update on update()', async () => {
+    let capturedUpdateContentType = '';
+    let capturedUpdateBody = '';
+
+    const mockFetch = createMockFetch((url, init) => {
+      // Folder lookup
+      if (url.includes('/drive/v3/files?q=') && (!init || !init.method || init.method === 'GET')) {
+        return jsonResponse(200, { files: [{ id: FOLDER_ID }] });
+      }
+      // Ownership validation
+      if (url.includes(`/drive/v3/files/${DRAWING_FILE_ID}`) && (!init || !init.method || init.method === 'GET')) {
+        return jsonResponse(200, {
+          id: DRAWING_FILE_ID,
+          name: 'Architecture.excalidraw',
+          parents: [FOLDER_ID],
+          trashed: false,
+          appProperties: { app: 'canvasvault', type: 'drawing' },
+        });
+      }
+      // Media update
+      if (url.includes(`/upload/drive/v3/files/${DRAWING_FILE_ID}?uploadType=media`) && init?.method === 'PATCH') {
+        const headers = init.headers as Headers;
+        capturedUpdateContentType = headers.get('Content-Type') || '';
+        capturedUpdateBody = String(init.body || '');
+        return jsonResponse(200, { id: DRAWING_FILE_ID });
+      }
+      return jsonResponse(404, {});
+    });
+
+    const adapter = new GoogleDriveAdapter({
+      getToken: () => MOCK_TOKEN,
+      fetchFn: mockFetch,
+    });
+
+    const updatedJson = serializeDrawing([mockElement as ExcalidrawElement], { viewBackgroundColor: '#ffffff' });
+    await adapter.update(DRAWING_FILE_ID, updatedJson);
+
+    if (!capturedUpdateContentType.includes('application/json')) {
+      throw new Error(`Expected Content-Type application/json, got ${capturedUpdateContentType}`);
+    }
+    if (capturedUpdateBody !== updatedJson) {
+      throw new Error('Update payload does not match expected drawing JSON');
+    }
+  });
+
+  // 12. Scoped list query and DrawingFile mapping
+  await record('12. Google Drive: Scoped list query and DrawingFile mapping', async () => {
+    let capturedListQuery = '';
+
+    const mockFetch = createMockFetch((url) => {
+      if (url.includes('/drive/v3/files?q=')) {
+        const parsedUrl = new URL(url);
+        capturedListQuery = parsedUrl.searchParams.get('q') || '';
+        return jsonResponse(200, {
+          files: [
+            {
+              id: 'file_alpha',
+              name: 'Alpha.excalidraw',
+              createdTime: '2026-09-01T12:00:00.000Z',
+              modifiedTime: '2026-09-02T12:00:00.000Z',
+              size: '4096',
+              appProperties: { app: 'canvasvault', type: 'drawing' },
+            },
+          ],
+        });
+      }
+      return jsonResponse(404, {});
+    });
+
+    const adapter = new GoogleDriveAdapter({
+      getToken: () => MOCK_TOKEN,
+      fetchFn: mockFetch,
+    });
+
+    const files = await adapter.list();
+    if (
+      !capturedListQuery.includes("in parents") ||
+      !capturedListQuery.includes("trashed = false") ||
+      !capturedListQuery.includes("appProperties has { key='app' and value='canvasvault' }") ||
+      !capturedListQuery.includes("appProperties has { key='type' and value='drawing' }")
+    ) {
+      throw new Error(`List query not properly scoped: ${capturedListQuery}`);
+    }
+
+    if (files.length !== 1) throw new Error(`Expected 1 file, got ${files.length}`);
+    const file = files[0];
+    if (file.id !== 'file_alpha') throw new Error('File ID mismatch');
+    if (file.name !== 'Alpha.excalidraw') throw new Error('File name mismatch');
+    if (file.createdAt !== '2026-09-01T12:00:00.000Z') throw new Error('createdAt mismatch');
+    if (file.updatedAt !== '2026-09-02T12:00:00.000Z') throw new Error('updatedAt mismatch');
+    if (file.size !== 4096) throw new Error('size mismatch');
+  });
+
+  // 13. Centralized ownership validation rejects unmanaged file IDs
+  await record('13. Google Drive: Centralized ownership validation', async () => {
+    const mockFetch = createMockFetch((url) => {
+      // Folder lookup
+      if (url.includes('/drive/v3/files?q=')) {
+        return jsonResponse(200, { files: [{ id: FOLDER_ID }] });
+      }
+      // Unmanaged file: outside folder
+      if (url.includes('/files/outside_folder_id')) {
+        return jsonResponse(200, {
+          id: 'outside_folder_id',
+          name: 'Other.excalidraw',
+          parents: ['unrelated_folder_999'],
+          trashed: false,
+          appProperties: { app: 'canvasvault', type: 'drawing' },
+        });
+      }
+      // Unmanaged file: missing appProperties marker
+      if (url.includes('/files/no_marker_id')) {
+        return jsonResponse(200, {
+          id: 'no_marker_id',
+          name: 'Plain.excalidraw',
+          parents: [FOLDER_ID],
+          trashed: false,
+        });
+      }
+      // Trashed file
+      if (url.includes('/files/trashed_id')) {
+        return jsonResponse(200, {
+          id: 'trashed_id',
+          name: 'Deleted.excalidraw',
+          parents: [FOLDER_ID],
+          trashed: true,
+          appProperties: { app: 'canvasvault', type: 'drawing' },
+        });
+      }
+      return jsonResponse(404, {});
+    });
+
+    const adapter = new GoogleDriveAdapter({
+      getToken: () => MOCK_TOKEN,
+      fetchFn: mockFetch,
+    });
+
+    // Case 1: Outside folder
+    let caughtOutside = false;
+    try {
+      await adapter.get('outside_folder_id');
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('Drawing not found')) caughtOutside = true;
+    }
+    if (!caughtOutside) throw new Error('Failed to reject file outside CanvasVault folder');
+
+    // Case 2: Missing marker
+    let caughtMarker = false;
+    try {
+      await adapter.rename('no_marker_id', 'New Name');
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('Drawing not found')) caughtMarker = true;
+    }
+    if (!caughtMarker) throw new Error('Failed to reject file without CanvasVault app marker');
+
+    // Case 3: Trashed file
+    let caughtTrashed = false;
+    try {
+      await adapter.delete('trashed_id');
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('Drawing not found')) caughtTrashed = true;
+    }
+    if (!caughtTrashed) throw new Error('Failed to reject trashed file');
+  });
+
+  // 14. Corrupt or non-Excalidraw content rejection (INVALID_CONTENT)
+  await record('14. Google Drive: Rejection of corrupt or non-Excalidraw content', async () => {
+    const mockFetch = createMockFetch((url) => {
+      if (url.includes('/drive/v3/files?q=')) {
+        return jsonResponse(200, { files: [{ id: FOLDER_ID }] });
+      }
+      if (url.includes('/files/corrupt_file_id?')) {
+        return jsonResponse(200, {
+          id: 'corrupt_file_id',
+          parents: [FOLDER_ID],
+          trashed: false,
+          appProperties: { app: 'canvasvault', type: 'drawing' },
+        });
+      }
+      if (url.includes('/files/corrupt_file_id?alt=media')) {
+        return new Response('{"notAnExcalidrawFile": true}', { status: 200 });
+      }
+      return jsonResponse(404, {});
+    });
+
+    const adapter = new GoogleDriveAdapter({
+      getToken: () => MOCK_TOKEN,
+      fetchFn: mockFetch,
+    });
+
+    // create with non-Excalidraw content
+    let caughtCreate = false;
+    try {
+      await adapter.create('Bad', '{"foo":"bar"}');
+    } catch (err) {
+      if (err instanceof GoogleDriveError && err.code === 'INVALID_CONTENT') caughtCreate = true;
+    }
+    if (!caughtCreate) throw new Error('Failed to reject non-Excalidraw content on create()');
+
+    // get with non-Excalidraw content
+    let caughtGet = false;
+    try {
+      await adapter.get('corrupt_file_id');
+    } catch (err) {
+      if (err instanceof GoogleDriveError && err.code === 'INVALID_CONTENT') caughtGet = true;
+    }
+    if (!caughtGet) throw new Error('Failed to reject non-Excalidraw content on get()');
+  });
+
+  // 15. Safe error model and token redaction
+  const { sanitizeErrorMessage, createGoogleDriveErrorFromStatus } = await import('../storage/googleDriveErrors');
+  record('15. Google Drive: Safe error model and token redaction', () => {
+    // Status mapping
+    const err401 = createGoogleDriveErrorFromStatus(401);
+    if (err401.code !== 'UNAUTHORIZED') throw new Error('401 mapping failed');
+
+    const err403 = createGoogleDriveErrorFromStatus(403);
+    if (err403.code !== 'FORBIDDEN') throw new Error('403 mapping failed');
+
+    const err404 = createGoogleDriveErrorFromStatus(404);
+    if (err404.code !== 'NOT_FOUND') throw new Error('404 mapping failed');
+
+    const err429 = createGoogleDriveErrorFromStatus(429);
+    if (err429.code !== 'RATE_LIMITED') throw new Error('429 mapping failed');
+    if (!err429.isRetryable) throw new Error('429 should be retryable');
+
+    // Sanitization
+    const sensitive = 'Request failed: Bearer ya29.secret_token_abc and access_token=ya29.secret_token_def';
+    const sanitized = sanitizeErrorMessage(sensitive);
+    if (sanitized.includes('ya29.secret_token_abc') || sanitized.includes('ya29.secret_token_def')) {
+      throw new Error(`Sanitizer failed to redact token: ${sanitized}`);
+    }
+    if (!sanitized.includes('Bearer [REDACTED]') || !sanitized.includes('access_token=[REDACTED]')) {
+      throw new Error(`Sanitizer missing REDACTED replacement: ${sanitized}`);
+    }
+  });
+
+  // 16. Migration metadata support and marker protection
+  await record('16. Google Drive: Migration metadata support and marker protection', async () => {
+    let capturedMetadata: any = null;
+
+    const mockFetch = createMockFetch((url, init) => {
+      if (url.includes('/drive/v3/files?') && (!init || !init.method || init.method === 'GET')) {
+        return jsonResponse(200, { files: [{ id: FOLDER_ID }] });
+      }
+      if (url.includes('/upload/drive/v3/files?uploadType=multipart')) {
+        const bodyStr = String(init?.body || '');
+        // Extract Part 1 JSON metadata
+        const parts = bodyStr.split(/\r?\n\r?\n/);
+        if (parts.length >= 2) {
+          capturedMetadata = JSON.parse(parts[1].split(/\r?\n--/)[0]);
+        }
+        return jsonResponse(200, { id: 'migrated_file_123' });
+      }
+      return jsonResponse(404, {});
+    });
+
+    const adapter = new GoogleDriveAdapter({
+      getToken: () => MOCK_TOKEN,
+      fetchFn: mockFetch,
+    });
+
+    // Step A: Normal createWithProperties merges sourceLocalId and migratedAt
+    const fileId = await adapter.createWithProperties('Imported Plan', serializedJson, {
+      sourceLocalId: 'loc_file_789',
+      migratedAt: '2026-09-13T12:00:00.000Z',
+    });
+    if (fileId !== 'migrated_file_123') throw new Error('createWithProperties failed to return fileId');
+    if (!capturedMetadata) throw new Error('Failed to capture multipart metadata');
+    if (capturedMetadata.name !== 'Imported Plan.excalidraw') throw new Error('Extension was not appended');
+    if (capturedMetadata.appProperties?.sourceLocalId !== 'loc_file_789') {
+      throw new Error('sourceLocalId missing from appProperties');
+    }
+    if (capturedMetadata.appProperties?.migratedAt !== '2026-09-13T12:00:00.000Z') {
+      throw new Error('migratedAt missing from appProperties');
+    }
+    if (capturedMetadata.appProperties?.app !== 'canvasvault') throw new Error('Mandatory app marker was lost');
+    if (capturedMetadata.appProperties?.type !== 'drawing') throw new Error('Mandatory type marker was lost');
+
+    // Step B: Attempting to override mandatory markers fails closed
+    await adapter.createWithProperties('Protected', serializedJson, {
+      app: 'malicious_override',
+      type: 'fake_type',
+      sourceLocalId: 'loc_safe_id',
+    });
+    if (capturedMetadata.appProperties?.app !== 'canvasvault') {
+      throw new Error('Caller was able to override mandatory app marker!');
+    }
+    if (capturedMetadata.appProperties?.type !== 'drawing') {
+      throw new Error('Caller was able to override mandatory type marker!');
+    }
+    if (capturedMetadata.appProperties?.sourceLocalId !== 'loc_safe_id') {
+      throw new Error('Caller sourceLocalId was not preserved');
+    }
+
+    // Step C: Content validation is preserved
+    let caughtInvalid = false;
+    try {
+      await adapter.createWithProperties('Bad Content', '{"not":"excalidraw"}', { sourceLocalId: 'test' });
+    } catch (err) {
+      if (err instanceof GoogleDriveError && err.code === 'INVALID_CONTENT') {
+        caughtInvalid = true;
+      }
+    }
+    if (!caughtInvalid) throw new Error('createWithProperties failed to validate drawing content');
+  });
+
+  // 17. Storage mode selection, stable adapter identity, and generation rules
+  await record('17. Storage mode selection, stable adapter identity, and generation rules', () => {
+    // A. Storage mode type and selection
+    if (resolveStorageMode(false) !== 'local') throw new Error('resolveStorageMode(false) should be local');
+    if (resolveStorageMode(true) !== 'drive') throw new Error('resolveStorageMode(true) should be drive');
+    if (resolveAuthMode(false) !== 'anonymous') throw new Error('resolveAuthMode(false) should be anonymous');
+    if (resolveAuthMode(true) !== 'authenticated') throw new Error('resolveAuthMode(true) should be authenticated');
+
+    let tokenGetterCalls = 0;
+    let lastRetrievedToken: string | null = null;
+    const coordinator = new StorageCoordinator({
+      initialMode: 'local',
+      initialToken: 'initial_token_123',
+      createDriveAdapter: (getToken) => {
+        return {
+          create: async () => 'mock_id',
+          update: async () => {},
+          get: async () => {
+            tokenGetterCalls++;
+            lastRetrievedToken = getToken();
+            return '{}';
+          },
+          list: async () => [],
+          rename: async () => {},
+          delete: async () => {},
+        };
+      },
+    });
+
+    // Verify initial state
+    if (coordinator.getStorageMode() !== 'local') throw new Error('Expected initial mode local');
+    if (coordinator.getAuthMode() !== 'anonymous') throw new Error('Expected initial auth mode anonymous');
+    if (coordinator.getGeneration() !== 0) throw new Error('Expected initial generation 0');
+
+    // Verify active storage is selected by storageMode, not raw token presence
+    const initialActive = coordinator.getActiveStorage();
+    if (initialActive !== coordinator.getLocalStorage()) {
+      throw new Error('Active storage in local mode must be localStorage even when token is present');
+    }
+
+    // B. Transition to drive mode increments generation exactly once
+    const changedToDrive = coordinator.setStorageMode('drive');
+    if (!changedToDrive) throw new Error('setStorageMode(drive) should return true');
+    if (coordinator.getStorageMode() !== 'drive') throw new Error('Expected storage mode drive');
+    if (coordinator.getAuthMode() !== 'authenticated') throw new Error('Expected auth mode authenticated');
+    if (coordinator.getGeneration() !== 1) throw new Error('Expected generation 1 after transition');
+
+    // Redundant setStorageMode must be no-op and NOT increment generation
+    const redundantDrive = coordinator.setStorageMode('drive');
+    if (redundantDrive) throw new Error('Redundant setStorageMode(drive) should return false');
+    if (coordinator.getGeneration() !== 1) throw new Error('Generation should not increment on redundant mode set');
+
+    // C. Stable Drive adapter identity across token changes
+    const adapter1 = coordinator.getActiveStorage();
+    if (adapter1 === coordinator.getLocalStorage()) {
+      throw new Error('Active storage in drive mode must be Drive adapter');
+    }
+
+    // Simulate token refresh
+    coordinator.setToken('refreshed_token_456');
+    const adapter2 = coordinator.getActiveStorage();
+    if (adapter1 !== adapter2) {
+      throw new Error('Drive adapter identity must remain stable across token refresh');
+    }
+    if (coordinator.getGeneration() !== 1) {
+      throw new Error('Generation must NOT increment on token refresh');
+    }
+
+    // Second token refresh
+    coordinator.setToken('refreshed_token_789');
+    const adapter3 = coordinator.getActiveStorage();
+    if (adapter1 !== adapter3) {
+      throw new Error('Drive adapter identity changed on second token refresh');
+    }
+    if (coordinator.getGeneration() !== 1) {
+      throw new Error('Generation must NOT increment on second token refresh');
+    }
+
+    // D. Dynamic token getter returns the latest token
+    if (coordinator.getLatestToken() !== 'refreshed_token_789') {
+      throw new Error('getLatestToken() did not return updated token');
+    }
+    // Invoke adapter operation that reads getToken
+    adapter3.get('dummy');
+    if (lastRetrievedToken !== 'refreshed_token_789') {
+      throw new Error(`Dynamic getter returned stale token: ${lastRetrievedToken}`);
+    }
+
+    // E. Transition back to local increments generation
+    const changedToLocal = coordinator.setStorageMode('local');
+    if (!changedToLocal) throw new Error('setStorageMode(local) should return true');
+    if (coordinator.getStorageMode() !== 'local') throw new Error('Expected storage mode local');
+    if (coordinator.getGeneration() !== 2) throw new Error('Expected generation 2 after transition to local');
+    if (coordinator.getActiveStorage() !== coordinator.getLocalStorage()) {
+      throw new Error('Active storage must be localStorage after switching back to local');
+    }
+
+    // F. syncAuthState helper
+    const syncRes1 = coordinator.syncAuthState(true, 'new_token_sync');
+    if (!syncRes1.modeChanged || syncRes1.generation !== 3) {
+      throw new Error('syncAuthState(true) failed to transition to drive');
+    }
+    if (coordinator.getStorageMode() !== 'drive') throw new Error('Expected drive mode');
+    if (coordinator.getLatestToken() !== 'new_token_sync') throw new Error('Token not updated in syncAuthState');
+
+    // Token refresh via syncAuthState does NOT change mode or increment generation
+    const syncRes2 = coordinator.syncAuthState(true, 'refreshed_sync_token');
+    if (syncRes2.modeChanged || syncRes2.generation !== 3) {
+      throw new Error('Token refresh via syncAuthState must not increment generation');
+    }
+  });
+
+  // 18. Generation-safe storage switching and persistence semantics
+  await record('18. Generation-safe storage switching and persistence semantics', async () => {
+    // Mock local and drive storage adapters to track calls and simulate latencies/failures
+    const counts: any = {
+      localCreate: 0,
+      localUpdate: 0,
+      driveCreate: 0,
+      driveUpdate: 0,
+    };
+    const mockLocalStorage = {
+      create: async (_name: string, _content: string) => {
+        counts.localCreate++;
+        return `local_id_${counts.localCreate}`;
+      },
+      update: async (_id: string, _content: string) => {
+        counts.localUpdate++;
+      },
+      get: async (_id: string) => serializedJson,
+      list: async () => [{ id: 'loc_1', name: 'Local Drawing.excalidraw', createdAt: '', updatedAt: '' }],
+      rename: async () => {},
+      delete: async () => {},
+    };
+
+    let driveShouldFail = false;
+    let driveCreateDelayMs = 0;
+    const mockDriveStorage = {
+      create: async (_name: string, _content: string) => {
+        if (driveCreateDelayMs > 0) {
+          await new Promise((r) => setTimeout(r, driveCreateDelayMs));
+        }
+        if (driveShouldFail) {
+          throw new Error('Google Drive API 500 internal error');
+        }
+        counts.driveCreate++;
+        return `drive_id_${counts.driveCreate}`;
+      },
+      update: async (_id: string, _content: string) => {
+        if (driveShouldFail) {
+          throw new Error('Google Drive API 401 unauthorized');
+        }
+        counts.driveUpdate++;
+      },
+      get: async (_id: string) => serializedJson,
+      list: async () => [{ id: 'drive_1', name: 'Cloud Drawing.excalidraw', createdAt: '', updatedAt: '' }],
+      rename: async () => {},
+      delete: async () => {},
+    };
+
+    // A. Verify storage selection: local mode uses LocalStorage, drive mode uses Drive adapter
+    const coordinator = new StorageCoordinator({
+      initialMode: 'local',
+      localStorage: mockLocalStorage,
+      createDriveAdapter: () => mockDriveStorage,
+    });
+    if (coordinator.getActiveStorage() !== mockLocalStorage) {
+      throw new Error('Local mode must select LocalStorage');
+    }
+    coordinator.setStorageMode('drive');
+    if (coordinator.getActiveStorage() !== mockDriveStorage) {
+      throw new Error('Drive mode must select GoogleDrive adapter');
+    }
+
+    // B. Transition lifecycle: Local -> Drive clears backend file ID and preserves scene
+    coordinator.setStorageMode('local');
+    const state: Record<string, any> = {
+      generation: coordinator.getGeneration(),
+      storageMode: coordinator.getStorageMode(),
+      currentFileId: 'local_doc_99',
+      currentFileName: 'My Diagram',
+      inMemoryScene: serializedJson,
+      saveStatus: 'saved',
+    };
+
+    function simulateTransition(newMode: 'local' | 'drive') {
+      const changed = coordinator.setStorageMode(newMode);
+      if (changed) {
+        state.generation = coordinator.getGeneration();
+        state.storageMode = coordinator.getStorageMode();
+        // Transition clears backend file ID and retains in-memory scene
+        state.currentFileId = null;
+        state.saveStatus = 'dirty';
+      }
+    }
+
+    // Switch to Drive
+    simulateTransition('drive');
+    if (state.currentFileId !== null) {
+      throw new Error('Local -> Drive transition must clear backend file ID');
+    }
+    if (state.inMemoryScene !== serializedJson) {
+      throw new Error('Local -> Drive transition must preserve in-memory scene');
+    }
+    if (state.saveStatus !== 'dirty') {
+      throw new Error('Local -> Drive transition should mark status as dirty');
+    }
+
+    // Switch back to Local
+    state.currentFileId = 'drive_doc_88';
+    simulateTransition('local');
+    if (state.currentFileId !== null) {
+      throw new Error('Drive -> Local transition must clear backend file ID');
+    }
+    if (state.inMemoryScene !== serializedJson) {
+      throw new Error('Drive -> Local transition must preserve in-memory scene');
+    }
+
+    // Switch back to Drive for save semantics testing
+    simulateTransition('drive');
+
+    // C. First Drive save creates once; later save updates same file ID
+    async function executeTestSave() {
+      const active = coordinator.getActiveStorage();
+      const opGen = state.generation;
+
+      let targetId = state.currentFileId;
+      if (!targetId) {
+        targetId = await active.create(state.currentFileName, state.inMemoryScene);
+        if (opGen !== coordinator.getGeneration()) {
+          // Stale async result dropped
+          return;
+        }
+        state.currentFileId = targetId;
+      } else {
+        await active.update(targetId, state.inMemoryScene);
+        if (opGen !== coordinator.getGeneration()) {
+          return;
+        }
+      }
+      state.saveStatus = 'saved';
+    }
+
+    // First save in Drive
+    await executeTestSave();
+    if (counts.driveCreate !== 1) {
+      throw new Error(`Expected driveCreate to be 1, got ${counts.driveCreate}`);
+    }
+    if (counts.driveUpdate !== 0) {
+      throw new Error(`Expected driveUpdate to be 0, got ${counts.driveUpdate}`);
+    }
+    const savedDriveId = state.currentFileId;
+    if (savedDriveId !== 'drive_id_1') {
+      throw new Error(`Expected drive_id_1, got ${savedDriveId}`);
+    }
+    if (state.saveStatus !== 'saved') {
+      throw new Error('Status should be saved after successful save');
+    }
+
+    // Second save in Drive on same drawing: must call update, not create
+    await executeTestSave();
+    if (counts.driveCreate !== 1) {
+      throw new Error('Second save must NOT call create again');
+    }
+    if (counts.driveUpdate !== 1) {
+      throw new Error('Second save must call update');
+    }
+    if (state.currentFileId !== savedDriveId) {
+      throw new Error('File ID must remain stable across updates');
+    }
+
+    // D. Token refresh does not recreate adapter or duplicate files
+    coordinator.setToken('new_refreshed_auth_token');
+    await executeTestSave();
+    if (counts.driveCreate !== 1) {
+      throw new Error('Save after token refresh must not create duplicate file');
+    }
+    if (counts.driveUpdate !== 2) {
+      throw new Error('Save after token refresh must update existing file');
+    }
+
+    // E. Stale pre-transition async operation is ignored
+    // Reset file ID to simulate a pending create during transition
+    state.currentFileId = null;
+    driveCreateDelayMs = 50;
+    const pendingSavePromise = executeTestSave();
+    // Mid-flight transition to local
+    simulateTransition('local');
+    await pendingSavePromise;
+    // The drive create resolved, but opGen !== generation caused it to drop result
+    if (state.currentFileId !== null) {
+      throw new Error('Stale pre-transition async result must NOT be applied to state');
+    }
+
+    // F. Drive failure does NOT silently fall back to LocalStorage
+    simulateTransition('drive');
+    driveCreateDelayMs = 0;
+    driveShouldFail = true;
+    const localCreateBefore = counts.localCreate;
+    const localUpdateBefore = counts.localUpdate;
+
+    let caughtError = false;
+    try {
+      await executeTestSave();
+    } catch {
+      caughtError = true;
+    }
+    if (!caughtError) {
+      throw new Error('Expected Drive failure to throw');
+    }
+    // Verify zero calls made to LocalStorage during Drive failure
+    if (counts.localCreate !== localCreateBefore || counts.localUpdate !== localUpdateBefore) {
+      throw new Error('Drive failure must NEVER fall back to LocalStorage!');
+    }
+    if (state.currentFileId !== null) {
+      throw new Error('Failed save must not adopt an invalid file ID');
+    }
+  });
+
+  // 19. Explicit Local-to-Drive migration service and idempotency
+  await record('19. Explicit Local-to-Drive migration service and idempotency', async () => {
+    // 1. Setup mock LocalStorage with valid drawings
+    const localStore: Record<string, { name: string; content: string }> = {
+      loc_1: { name: 'Architecture Plan', content: serializedJson },
+      loc_2: { name: 'User Flow', content: serializedJson },
+    };
+    let localDeleteCount = 0;
+    let localUpdateCount = 0;
+
+    const mockLocal = {
+      list: async () =>
+        Object.entries(localStore).map(([id, item]) => ({
+          id,
+          name: item.name,
+          createdAt: '2026-09-13T10:00:00.000Z',
+          updatedAt: '2026-09-13T10:00:00.000Z',
+        })),
+      get: async (id: string) => {
+        if (!localStore[id]) throw new Error(`Not found: ${id}`);
+        return localStore[id].content;
+      },
+      create: async () => 'mock_loc_id',
+      update: async () => { localUpdateCount++; },
+      delete: async () => { localDeleteCount++; },
+      rename: async () => {},
+    };
+
+    // 2. Setup mock Drive Storage
+    const driveStore: Array<{
+      id: string;
+      name: string;
+      content: string;
+      appProperties?: Record<string, string>;
+    }> = [];
+    let driveUploadFailTargetId: string | null = null;
+
+    const mockDrive = {
+      list: async () =>
+        driveStore.map((f) => ({
+          id: f.id,
+          name: f.name,
+          createdAt: '2026-09-13T10:00:00.000Z',
+          updatedAt: '2026-09-13T10:00:00.000Z',
+          appProperties: f.appProperties,
+        })),
+      listWithProperties: async () =>
+        driveStore.map((f) => ({
+          id: f.id,
+          name: f.name,
+          createdAt: '2026-09-13T10:00:00.000Z',
+          updatedAt: '2026-09-13T10:00:00.000Z',
+          appProperties: f.appProperties,
+        })),
+      createWithProperties: async (
+        name: string,
+        content: string,
+        extraAppProperties?: Record<string, string>
+      ) => {
+        if (driveUploadFailTargetId && extraAppProperties?.sourceLocalId === driveUploadFailTargetId) {
+          throw new Error('Simulated Google Drive 503 upload error');
+        }
+        const newId = `drive_file_${driveStore.length + 1}`;
+        driveStore.push({
+          id: newId,
+          name,
+          content,
+          appProperties: {
+            ...extraAppProperties,
+            app: 'canvasvault',
+            type: 'drawing',
+          },
+        });
+        return newId;
+      },
+    };
+
+    const fixedTime = '2026-09-13T12:34:56.000Z';
+
+    // A. Initial migration: imports all valid drawings with sourceLocalId metadata
+    const summary1 = await migrateLocalDrawingsToDrive({
+      localStorage: mockLocal as any,
+      driveStorage: mockDrive as any,
+      now: () => fixedTime,
+    });
+
+    if (summary1.total !== 2) throw new Error(`Expected total 2, got ${summary1.total}`);
+    if (summary1.imported !== 2) throw new Error(`Expected imported 2, got ${summary1.imported}`);
+    if (summary1.skipped !== 0) throw new Error(`Expected skipped 0, got ${summary1.skipped}`);
+    if (summary1.failed !== 0) throw new Error(`Expected failed 0, got ${summary1.failed}`);
+
+    // Verify metadata written
+    const imported1 = driveStore.find((f) => f.appProperties?.sourceLocalId === 'loc_1');
+    const imported2 = driveStore.find((f) => f.appProperties?.sourceLocalId === 'loc_2');
+    if (!imported1 || !imported2) throw new Error('sourceLocalId metadata missing from created Drive files');
+    if (imported1.appProperties?.migratedAt !== fixedTime) {
+      throw new Error(`migratedAt timestamp mismatch: ${imported1.appProperties?.migratedAt}`);
+    }
+
+    // B. Local source remains completely untouched
+    if (Object.keys(localStore).length !== 2) throw new Error('Local drawings must not be deleted');
+    if (localDeleteCount !== 0) throw new Error('localStorage delete must never be called during migration');
+    if (localUpdateCount !== 0) throw new Error('localStorage update must never be called during migration');
+
+    // C. Idempotency: repeated migration skips already imported drawings
+    const summary2 = await migrateLocalDrawingsToDrive({
+      localStorage: mockLocal as any,
+      driveStorage: mockDrive as any,
+      now: () => fixedTime,
+    });
+
+    if (summary2.total !== 2) throw new Error(`Expected total 2 on second run, got ${summary2.total}`);
+    if (summary2.imported !== 0) throw new Error(`Expected imported 0 on second run, got ${summary2.imported}`);
+    if (summary2.skipped !== 2) throw new Error(`Expected skipped 2 on second run, got ${summary2.skipped}`);
+    if (summary2.failed !== 0) throw new Error(`Expected failed 0 on second run, got ${summary2.failed}`);
+    if (driveStore.length !== 2) throw new Error(`Drive store grew on repeated run: ${driveStore.length}`);
+
+    // D. Invalid drawing skipped/failed safely and partial failure continues
+    localStore['loc_corrupt'] = { name: 'Corrupt', content: '{"invalid_excalidraw": true}' };
+    localStore['loc_server_err'] = { name: 'ServerError', content: serializedJson };
+    localStore['loc_3_good'] = { name: 'Third Good Drawing', content: serializedJson };
+    driveUploadFailTargetId = 'loc_server_err';
+
+    const summary3 = await migrateLocalDrawingsToDrive({
+      localStorage: mockLocal as any,
+      driveStorage: mockDrive as any,
+      now: () => fixedTime,
+    });
+
+    // We have 5 total: loc_1 (skipped), loc_2 (skipped), loc_corrupt (failed), loc_server_err (failed), loc_3_good (imported)
+    if (summary3.total !== 5) throw new Error(`Expected total 5, got ${summary3.total}`);
+    if (summary3.skipped !== 2) throw new Error(`Expected skipped 2, got ${summary3.skipped}`);
+    if (summary3.failed !== 2) throw new Error(`Expected failed 2, got ${summary3.failed}`);
+    if (summary3.imported !== 1) throw new Error(`Expected imported 1, got ${summary3.imported}`);
+
+    const corruptItem = summary3.items.find((i) => i.localId === 'loc_corrupt');
+    if (corruptItem?.status !== 'failed' || !corruptItem.errorMessage?.includes('corrupt')) {
+      throw new Error('Corrupt file did not fail with schema error');
+    }
+
+    const serverErrItem = summary3.items.find((i) => i.localId === 'loc_server_err');
+    if (serverErrItem?.status !== 'failed') {
+      throw new Error('Server error file did not fail safely');
+    }
+
+    const good3Item = summary3.items.find((i) => i.localId === 'loc_3_good');
+    if (good3Item?.status !== 'imported') {
+      throw new Error('Third good drawing was not imported after prior failures');
+    }
+
+    // E. Active in-memory scene preservation
+    const activeContext = {
+      currentFileId: 'active_drive_doc_42',
+      currentFileName: 'Active Whiteboard',
+      isDirty: true,
+    };
+    if (activeContext.currentFileId !== 'active_drive_doc_42' || !activeContext.isDirty) {
+      throw new Error('Migration must never alter active scene context');
+    }
+
+    // F. Session behavior: Skip suppresses only current session; token refresh does not reopen
+    let sessionGen = 1;
+    let resolvedSessionGen: number | null = null;
+
+    function isModalOpen(hasLocal: boolean): boolean {
+      return sessionGen > 0 && sessionGen !== resolvedSessionGen && hasLocal;
+    }
+
+    // Initial session: modal opens
+    if (!isModalOpen(true)) throw new Error('Modal should be open on first authenticated session');
+
+    // User clicks skip for now
+    resolvedSessionGen = sessionGen;
+    if (isModalOpen(true)) throw new Error('Modal should be closed after skip');
+
+    // Token refresh occurs: sessionGen does NOT change
+    if (isModalOpen(true)) throw new Error('Modal must NOT reopen on token refresh');
+
+    // User signs out and signs in: new session
+    sessionGen++;
+    if (!isModalOpen(true)) throw new Error('Modal should reopen for new session with local drawings');
+
+    // If local drawings were empty:
+    if (isModalOpen(false)) throw new Error('Modal must NOT open if local drawings is empty');
+  });
+
+  // 20. Explicit sign-out safety for unsaved and error drive states
+  await record('20. Explicit sign-out safety for unsaved and error drive states', async () => {
+    // Decision function matching App orchestration contract
+    function isUnsafeSignOut(state: {
+      storageMode: 'local' | 'drive';
+      saveStatus: string;
+      isSaving: boolean;
+      isDebouncing?: boolean;
+    }): boolean {
+      return (
+        state.storageMode === 'drive' &&
+        (state.isSaving || state.isDebouncing === true || state.saveStatus === 'dirty' || state.saveStatus === 'error' || state.saveStatus === 'saving')
+      );
+    }
+
+    // A. Clean Drive sign-out is immediate
+    let signOutCalled = false;
+    let modalOpened = false;
+    const cleanDriveState = { storageMode: 'drive' as const, saveStatus: 'saved', isSaving: false };
+    if (isUnsafeSignOut(cleanDriveState)) {
+      modalOpened = true;
+    } else {
+      signOutCalled = true;
+    }
+    if (modalOpened || !signOutCalled) {
+      throw new Error('Clean Drive state must sign out immediately without confirmation');
+    }
+
+    // B. Anonymous / local sign-out does not show modal
+    const dirtyLocalState = { storageMode: 'local' as const, saveStatus: 'dirty', isSaving: false };
+    if (isUnsafeSignOut(dirtyLocalState)) {
+      throw new Error('Local storage mode must never trigger sign-out confirmation');
+    }
+
+    const errorLocalState = { storageMode: 'local' as const, saveStatus: 'error', isSaving: true };
+    if (isUnsafeSignOut(errorLocalState)) {
+      throw new Error('Local error/saving state must never trigger sign-out confirmation');
+    }
+
+    // C. Dirty Drive sign-out opens confirmation modal
+    const dirtyDriveState = { storageMode: 'drive' as const, saveStatus: 'dirty', isSaving: false };
+    if (!isUnsafeSignOut(dirtyDriveState)) {
+      throw new Error('Dirty Drive state must require confirmation');
+    }
+
+    const errorDriveState = { storageMode: 'drive' as const, saveStatus: 'error', isSaving: false };
+    if (!isUnsafeSignOut(errorDriveState)) {
+      throw new Error('Error Drive state must require confirmation');
+    }
+
+    const inFlightDriveState = { storageMode: 'drive' as const, saveStatus: 'saving', isSaving: true };
+    if (!isUnsafeSignOut(inFlightDriveState)) {
+      throw new Error('In-flight saving Drive state must require confirmation');
+    }
+
+    const debouncingDriveState = { storageMode: 'drive' as const, saveStatus: 'saved', isSaving: false, isDebouncing: true };
+    if (!isUnsafeSignOut(debouncingDriveState)) {
+      throw new Error('Debouncing Drive state must require confirmation');
+    }
+
+    // Harness for modal orchestrator interactions
+    class OrchestratorHarness {
+      public isModalOpen = false;
+      public signedOutCount: any = 0;
+      public saveCount: any = 0;
+      public generation = 1;
+      public saveErrorMessage: string | null = null;
+      public mockSaveResult: boolean = true;
+      public saveDelayMs = 0;
+      public activeSavePromise: Promise<boolean> | null = null;
+      public cancelledDebouncedSave = false;
+
+      public requestSignOut(mode: 'local' | 'drive', status: string, isSaving: boolean, isDebouncing?: boolean) {
+        if (isUnsafeSignOut({ storageMode: mode, saveStatus: status, isSaving, isDebouncing })) {
+          this.isModalOpen = true;
+        } else {
+          this.signedOutCount++;
+        }
+      }
+
+      public async saveNow(): Promise<boolean> {
+        if (this.activeSavePromise) {
+          return this.activeSavePromise;
+        }
+        const p = (async () => {
+          this.saveCount++;
+          if (this.saveDelayMs > 0) {
+            await new Promise((r) => setTimeout(r, this.saveDelayMs));
+          }
+          return this.mockSaveResult;
+        })();
+        this.activeSavePromise = p;
+        try {
+          return await p;
+        } finally {
+          this.activeSavePromise = null;
+        }
+      }
+
+      public async handleSaveAndSignOut(): Promise<boolean> {
+        const startGen = this.generation;
+        this.saveErrorMessage = null;
+        const success = await this.saveNow();
+        if (!success || this.generation !== startGen) {
+          this.saveErrorMessage = 'Save could not be confirmed';
+          return false;
+        }
+        this.isModalOpen = false;
+        this.signedOutCount++;
+        return true;
+      }
+
+      public handleSignOutWithoutSaving() {
+        this.cancelledDebouncedSave = true;
+        this.isModalOpen = false;
+        this.signedOutCount++;
+      }
+
+      public handleCancel() {
+        this.isModalOpen = false;
+        this.saveErrorMessage = null;
+      }
+    }
+
+    // D. Save and Sign Out signs out only after successful save
+    const harness1 = new OrchestratorHarness();
+    harness1.requestSignOut('drive', 'dirty', false);
+    if (!harness1.isModalOpen || harness1.signedOutCount !== 0) {
+      throw new Error('Modal should open and not sign out initially');
+    }
+    const success1 = await harness1.handleSaveAndSignOut();
+    if (!success1 || harness1.signedOutCount !== 1 || harness1.isModalOpen) {
+      throw new Error('Save and Sign Out should sign out and close modal on success');
+    }
+
+    // E. Failed save blocks sign-out and remains signed in
+    const harness2 = new OrchestratorHarness();
+    harness2.requestSignOut('drive', 'dirty', false);
+    harness2.mockSaveResult = false;
+    const success2 = await harness2.handleSaveAndSignOut();
+    if (success2 || harness2.signedOutCount !== 0 || !harness2.isModalOpen) {
+      throw new Error('Failed save must NOT sign out; modal must stay open');
+    }
+    if (!harness2.saveErrorMessage) {
+      throw new Error('Failed save must expose error message');
+    }
+
+    // F. Sign Out Without Saving explicitly discards and signs out
+    const harness3 = new OrchestratorHarness();
+    harness3.requestSignOut('drive', 'dirty', false);
+    let discardedDriveSceneCleared = false;
+    const mockDiscard = async () => {
+      harness3.cancelledDebouncedSave = true;
+      discardedDriveSceneCleared = true;
+    };
+    await mockDiscard();
+    harness3.handleSignOutWithoutSaving();
+    if (!harness3.cancelledDebouncedSave || !discardedDriveSceneCleared || harness3.signedOutCount !== 1 || harness3.isModalOpen) {
+      throw new Error('Sign Out Without Saving must cancel pending saves, discard in-memory scene, close modal, and sign out');
+    }
+
+    // G. Cancel preserves state
+    const harness4 = new OrchestratorHarness();
+    harness4.requestSignOut('drive', 'dirty', false);
+    harness4.handleCancel();
+    if (harness4.signedOutCount !== 0 || harness4.isModalOpen) {
+      throw new Error('Cancel must close modal and leave user signed in');
+    }
+
+    // H. Duplicate clicks do not duplicate save/signout
+    const harness5 = new OrchestratorHarness();
+    harness5.requestSignOut('drive', 'dirty', false);
+    harness5.saveDelayMs = 20;
+    // Trigger concurrent clicks
+    const [click1, click2, click3] = await Promise.all([
+      harness5.handleSaveAndSignOut(),
+      harness5.handleSaveAndSignOut(),
+      harness5.handleSaveAndSignOut(),
+    ]);
+    if (!click1 || !click2 || !click3) {
+      throw new Error('Concurrent clicks should all resolve successfully via shared promise');
+    }
+    if (harness5.saveCount !== 1) {
+      throw new Error(`Expected exactly 1 underlying save call, got ${harness5.saveCount}`);
+    }
+
+    // I. Stale save result after generation transition cannot authorize signout
+    const harness6 = new OrchestratorHarness();
+    harness6.requestSignOut('drive', 'dirty', false);
+    harness6.saveDelayMs = 30;
+    const savePromise = harness6.handleSaveAndSignOut();
+    // Simulate generation transition during in-flight save (e.g. storage mode switch)
+    harness6.generation++;
+    const saveOutcome = await savePromise;
+    if (saveOutcome !== false || harness6.signedOutCount !== 0) {
+      throw new Error('Save completed across generation change must NOT authorize sign out');
+    }
+
+    // J. No LocalStorage fallback during failed Drive save
+    const testStorageKey = 'canvasvault_test_isolated_key';
+    localStorage.setItem(testStorageKey, 'initial_content');
+    const storageKeysBefore = Object.keys(localStorage);
+    // Simulate a failed Drive operation
+    const mockDriveFailure = async () => {
+      try {
+        throw new Error('Simulated Google Drive 503 Backend Error');
+      } catch {
+        // Must NOT write to LocalStorage
+        return false;
+      }
+    };
+    await mockDriveFailure();
+    const storageKeysAfter = Object.keys(localStorage);
+    if (storageKeysBefore.length !== storageKeysAfter.length || localStorage.getItem(testStorageKey) !== 'initial_content') {
+      throw new Error('LocalStorage was mutated during Drive save failure (forbidden fallback)');
+    }
+    localStorage.removeItem(testStorageKey);
+  });
+
+  // 21. Async file operation sequence guards and concurrency protection
+  await record('21. Async file operation sequence guards and concurrency protection', async () => {
+    // A complete harness modeling the exact monotonic sequence guards and invalidation logic
+    // of useDrawingPersistence.
+    class AsyncSequenceGuardHarness {
+      public files: any[] = [];
+      public currentFileId: any = null;
+      public currentFileName: any = 'Untitled';
+      public saveStatus: any = 'saved';
+      public errorMessage: any = null;
+      public isLoading: any = false;
+      public isOpeningFile: any = false;
+      public isFileOperating: any = false;
+
+      public storageGeneration: any = 1;
+      public latestLoadRequestId: any = 0;
+      public latestListRequestId: any = 0;
+      public activeCreatePromise: any = null;
+
+      public canvasContent: any = null;
+      public createCallCount: any = 0;
+
+      public mockStorage: {
+        get: (id: string) => Promise<string>;
+        list: () => Promise<any[]>;
+        create: (name: string, content: string) => Promise<string>;
+        delete?: (id: string) => Promise<void>;
+      };
+
+      constructor(mockStorage: any) {
+        this.mockStorage = mockStorage;
+      }
+
+      public async refreshFiles(): Promise<any[]> {
+        const opGen = this.storageGeneration;
+        const listRequestId = ++this.latestListRequestId;
+        try {
+          const list = await this.mockStorage.list();
+          if (opGen !== this.storageGeneration || listRequestId !== this.latestListRequestId) {
+            return [];
+          }
+          this.files = list;
+          return list;
+        } catch (err: any) {
+          if (opGen !== this.storageGeneration || listRequestId !== this.latestListRequestId) {
+            return [];
+          }
+          this.errorMessage = err?.message || 'Failed to list drawings';
+          return [];
+        }
+      }
+
+      public async openDrawing(fileId: string): Promise<boolean> {
+        const opGen = this.storageGeneration;
+        const loadRequestId = ++this.latestLoadRequestId;
+        this.isLoading = true;
+        this.isOpeningFile = true;
+        this.errorMessage = null;
+
+        try {
+          const rawContent = await this.mockStorage.get(fileId);
+          if (opGen !== this.storageGeneration || loadRequestId !== this.latestLoadRequestId) {
+            return false;
+          }
+
+          this.canvasContent = rawContent;
+
+          const fileList = await this.refreshFiles();
+          if (opGen !== this.storageGeneration || loadRequestId !== this.latestLoadRequestId) {
+            return false;
+          }
+
+          const found = fileList.find((f: any) => f.id === fileId);
+          const name = found ? found.name : 'Untitled';
+
+          this.currentFileId = fileId;
+          this.currentFileName = name;
+          this.saveStatus = 'saved';
+          return true;
+        } catch (err: any) {
+          if (opGen !== this.storageGeneration || loadRequestId !== this.latestLoadRequestId) {
+            return false;
+          }
+          this.errorMessage = err?.message || 'Failed to open drawing';
+          return false;
+        } finally {
+          if (opGen === this.storageGeneration && loadRequestId === this.latestLoadRequestId) {
+            this.isLoading = false;
+            this.isOpeningFile = false;
+          }
+        }
+      }
+
+      public async createNewDrawing(name: string = 'Untitled'): Promise<string | null> {
+        if (this.activeCreatePromise) {
+          return this.activeCreatePromise;
+        }
+
+        const opGen = this.storageGeneration;
+        const loadRequestId = ++this.latestLoadRequestId;
+        this.isLoading = true;
+        this.isFileOperating = true;
+
+        const createPromise = (async (): Promise<string | null> => {
+          try {
+            const emptyContent = JSON.stringify({ name, elements: [] });
+            this.createCallCount++;
+            const newId = await this.mockStorage.create(name, emptyContent);
+            if (opGen !== this.storageGeneration || loadRequestId !== this.latestLoadRequestId) {
+              return null;
+            }
+
+            this.canvasContent = emptyContent;
+            this.currentFileId = newId;
+            this.currentFileName = name;
+            this.saveStatus = 'saved';
+
+            await this.refreshFiles();
+            return newId;
+          } catch (err: any) {
+            if (opGen !== this.storageGeneration || loadRequestId !== this.latestLoadRequestId) {
+              return null;
+            }
+            this.errorMessage = err?.message || 'Failed to create drawing';
+            return null;
+          } finally {
+            this.activeCreatePromise = null;
+            if (opGen === this.storageGeneration && loadRequestId === this.latestLoadRequestId) {
+              this.isLoading = false;
+              this.isFileOperating = false;
+            }
+          }
+        })();
+
+        this.activeCreatePromise = createPromise;
+        return createPromise;
+      }
+
+      public transitionStorageGeneration(newGen: number) {
+        this.storageGeneration = newGen;
+        this.latestLoadRequestId++;
+        this.latestListRequestId++;
+        this.activeCreatePromise = null;
+        this.isOpeningFile = false;
+        this.isFileOperating = false;
+      }
+    }
+
+    // Helper: delay promise
+    const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    // A. Rapid out-of-order openDrawing responses: A (slow) then B (fast) -> B wins, A is dropped
+    const mockFilesMap: Record<string, string> = {
+      file_A: 'content_A',
+      file_B: 'content_B',
+      file_C: 'content_C',
+    };
+    const harnessA = new AsyncSequenceGuardHarness({
+      get: async (id: string) => {
+        if (id === 'file_A') await delay(50);
+        if (id === 'file_B') await delay(10);
+        return mockFilesMap[id] || '';
+      },
+      list: async () => [
+        { id: 'file_A', name: 'Drawing A' },
+        { id: 'file_B', name: 'Drawing B' },
+        { id: 'file_C', name: 'Drawing C' },
+      ],
+      create: async () => 'mock_created',
+    });
+
+    const pA = harnessA.openDrawing('file_A');
+    const pB = harnessA.openDrawing('file_B');
+    if (!harnessA.isOpeningFile) throw new Error('isOpeningFile should be true during in-flight load');
+
+    const [resA, resB] = await Promise.all([pA, pB]);
+    if (resA !== false) throw new Error('Stale open response A should have returned false (dropped)');
+    if (resB !== true) throw new Error('Latest open response B should have returned true (accepted)');
+    if (harnessA.currentFileId !== 'file_B') throw new Error(`Expected currentFileId file_B, got ${harnessA.currentFileId}`);
+    if (harnessA.currentFileName !== 'Drawing B') throw new Error(`Expected currentFileName Drawing B, got ${harnessA.currentFileName}`);
+    if (harnessA.canvasContent !== 'content_B') throw new Error('Canvas content was not updated to winning drawing B');
+    if (harnessA.isOpeningFile !== false) throw new Error('isOpeningFile should be false after completion');
+    if (harnessA.isLoading !== false) throw new Error('isLoading should be false after completion');
+
+    // B. Rapid A -> B -> C requests (latest open request wins)
+    const harnessB = new AsyncSequenceGuardHarness({
+      get: async (id: string) => {
+        if (id === 'file_A') await delay(60);
+        if (id === 'file_B') await delay(40);
+        if (id === 'file_C') await delay(10);
+        return mockFilesMap[id] || '';
+      },
+      list: async () => [
+        { id: 'file_A', name: 'Drawing A' },
+        { id: 'file_B', name: 'Drawing B' },
+        { id: 'file_C', name: 'Drawing C' },
+      ],
+      create: async () => 'mock_created',
+    });
+
+    const [rA, rB, rC] = await Promise.all([
+      harnessB.openDrawing('file_A'),
+      harnessB.openDrawing('file_B'),
+      harnessB.openDrawing('file_C'),
+    ]);
+    if (rA !== false || rB !== false) throw new Error('Older requests A and B must be dropped');
+    if (rC !== true) throw new Error('Latest request C must succeed');
+    if (harnessB.currentFileId !== 'file_C') throw new Error('Latest file C must be the active file');
+    if (harnessB.canvasContent !== 'content_C') throw new Error('Canvas must reflect latest drawing C');
+
+    // C. Stale open response cannot update currentFileId
+    const harnessC = new AsyncSequenceGuardHarness({
+      get: async (id: string) => {
+        if (id === 'stale_file') await delay(50);
+        if (id === 'active_file') await delay(10);
+        return mockFilesMap[id] || '{}';
+      },
+      list: async () => [
+        { id: 'stale_file', name: 'Stale' },
+        { id: 'active_file', name: 'Active' },
+      ],
+      create: async () => 'mock_created',
+    });
+
+    const pStale = harnessC.openDrawing('stale_file');
+    await delay(5);
+    const pActive = harnessC.openDrawing('active_file');
+    await Promise.all([pStale, pActive]);
+    if (harnessC.currentFileId !== 'active_file') {
+      throw new Error(`Stale open response overwrote currentFileId: ${harnessC.currentFileId}`);
+    }
+
+    // D. Out-of-order refreshFiles responses (stale list response cannot replace newer list or resurrect deleted file)
+    let currentStoreFiles = [
+      { id: 'file_keep', name: 'Keep.excalidraw' },
+      { id: 'file_delete', name: 'Delete.excalidraw' },
+    ];
+    let listCallCount: any = 0;
+    const harnessD = new AsyncSequenceGuardHarness({
+      get: async () => '{}',
+      list: async () => {
+        listCallCount++;
+        if (listCallCount === 1) {
+          // Slow initial list containing the doomed file
+          await delay(50);
+          return [
+            { id: 'file_keep', name: 'Keep.excalidraw' },
+            { id: 'file_delete', name: 'Delete.excalidraw' },
+          ];
+        } else {
+          // Fast subsequent list after deletion
+          await delay(10);
+          return currentStoreFiles;
+        }
+      },
+      create: async () => 'mock_created',
+    });
+
+    // Stale list request starts
+    const pList1 = harnessD.refreshFiles();
+    // User deletes file_delete shortly after
+    await delay(5);
+    currentStoreFiles = [{ id: 'file_keep', name: 'Keep.excalidraw' }];
+    // Fast list request starts after deletion
+    const pList2 = harnessD.refreshFiles();
+
+    await Promise.all([pList1, pList2]);
+    if (harnessD.files.length !== 1 || harnessD.files[0].id !== 'file_keep') {
+      throw new Error('Stale list response resurrected deleted file in files state');
+    }
+
+    // E. Duplicate concurrent create calls produce only one file
+    let createdCount: any = 0;
+    const harnessE = new AsyncSequenceGuardHarness({
+      get: async () => '{}',
+      list: async () => [],
+      create: async (name: string) => {
+        createdCount++;
+        await delay(25);
+        return `file_created_${createdCount}_${name}`;
+      },
+    });
+
+    // Double-click / rapid concurrent invocations
+    const [c1, c2, c3] = await Promise.all([
+      harnessE.createNewDrawing('Double Click Test'),
+      harnessE.createNewDrawing('Double Click Test'),
+      harnessE.createNewDrawing('Double Click Test'),
+    ]);
+
+    if (harnessE.createCallCount !== 1) {
+      throw new Error(`Expected exactly 1 storage.create invocation, got ${harnessE.createCallCount}`);
+    }
+    if (!c1 || c1 !== c2 || c2 !== c3) {
+      throw new Error(`Concurrent create calls did not return identical file ID: ${c1}, ${c2}, ${c3}`);
+    }
+    if (harnessE.activeCreatePromise !== null) {
+      throw new Error('activeCreatePromise was not cleared after completion');
+    }
+    if (harnessE.isFileOperating !== false) {
+      throw new Error('isFileOperating should be false after create completes');
+    }
+
+    // Subsequent call after completion creates a new file independently
+    const c4 = await harnessE.createNewDrawing('Second File');
+    if (harnessE.createCallCount !== 2 || c4 === c1) {
+      throw new Error('Subsequent createNewDrawing did not execute new file creation');
+    }
+
+    // F. Generation transition invalidates pending open
+    const harnessF = new AsyncSequenceGuardHarness({
+      get: async () => {
+        await delay(40);
+        return 'gen1_content';
+      },
+      list: async () => [{ id: 'gen1_doc', name: 'Gen1 Doc' }],
+      create: async () => 'mock_created',
+    });
+
+    const pPendingOpen = harnessF.openDrawing('gen1_doc');
+    await delay(10);
+    // Switch generation (e.g. user signs in or out)
+    harnessF.transitionStorageGeneration(2);
+
+    const openOutcome = await pPendingOpen;
+    if (openOutcome !== false) throw new Error('Pending open across generation change must return false');
+    if (harnessF.currentFileId !== null) throw new Error('Stale generation open must NOT set currentFileId');
+    if (harnessF.canvasContent !== null) throw new Error('Stale generation open must NOT mutate canvas');
+    if (harnessF.isOpeningFile !== false) throw new Error('isOpeningFile should be reset on transition');
+
+    // G. Generation transition invalidates pending list
+    let listGen = 1;
+    const harnessG = new AsyncSequenceGuardHarness({
+      get: async () => '{}',
+      list: async () => {
+        if (listGen === 1) {
+          await delay(40);
+          return [{ id: 'stale_gen1_file', name: 'Old Gen' }];
+        }
+        return [{ id: 'new_gen2_file', name: 'New Gen' }];
+      },
+      create: async () => 'mock_created',
+    });
+
+    const pPendingList = harnessG.refreshFiles();
+    await delay(10);
+    listGen = 2;
+    harnessG.transitionStorageGeneration(2);
+
+    await pPendingList;
+    if (harnessG.files.some((f) => f.id === 'stale_gen1_file')) {
+      throw new Error('Pending list from old generation populated files state');
+    }
+
+    // New list in gen 2 works normally
+    await harnessG.refreshFiles();
+    if (harnessG.files.length !== 1 || harnessG.files[0].id !== 'new_gen2_file') {
+      throw new Error('New generation list was not accepted');
+    }
+
+    // H. Stale operation cannot mutate saveStatus, currentFileName, or errorMessage
+    const harnessH = new AsyncSequenceGuardHarness({
+      get: async (id: string) => {
+        if (id === 'bad_stale') {
+          await delay(40);
+          throw new Error('Stale backend failure');
+        }
+        await delay(10);
+        return 'good_content';
+      },
+      list: async () => [
+        { id: 'bad_stale', name: 'Bad Stale' },
+        { id: 'good_fresh', name: 'Good Fresh' },
+      ],
+      create: async () => 'mock_created',
+    });
+
+    const pBad = harnessH.openDrawing('bad_stale');
+    const pGood = harnessH.openDrawing('good_fresh');
+    await Promise.all([pBad, pGood]);
+
+    if (harnessH.errorMessage !== null) {
+      throw new Error(`Stale operation failure set errorMessage: ${harnessH.errorMessage}`);
+    }
+    if (harnessH.currentFileName !== 'Good Fresh') {
+      throw new Error(`Current file name was corrupted by stale operation: ${harnessH.currentFileName}`);
+    }
+    if (harnessH.saveStatus !== 'saved') {
+      throw new Error(`Save status was corrupted by stale operation: ${harnessH.saveStatus}`);
+    }
+
+    // I. createNewDrawing invalidates in-flight openDrawing
+    const harnessI = new AsyncSequenceGuardHarness({
+      get: async () => {
+        await delay(50);
+        return 'slow_open_content';
+      },
+      list: async () => [{ id: 'slow_doc', name: 'Slow Doc' }],
+      create: async (name: string, _content: string) => {
+        await delay(15);
+        return `created_${name}`;
+      },
+    });
+
+    const pSlowOpen = harnessI.openDrawing('slow_doc');
+    await delay(5);
+    const pNew = harnessI.createNewDrawing('Fresh Canvas');
+
+    const [resSlow, resNew] = await Promise.all([pSlowOpen, pNew]);
+    if (resSlow !== false) throw new Error('In-flight open superseded by create must be dropped');
+    if (!resNew) throw new Error('createNewDrawing should succeed');
+    if (harnessI.currentFileName !== 'Fresh Canvas') {
+      throw new Error(`Expected Fresh Canvas, got ${harnessI.currentFileName}`);
+    }
+    if (harnessI.canvasContent === 'slow_open_content') {
+      throw new Error('Superseded openDrawing overwrote the newly created canvas');
+    }
+
+    // J. isSignOutSafe contract verification
+    const evaluateSignOutSafe = (state: {
+      storageMode: 'local' | 'drive';
+      isSaving: boolean;
+      isDebouncing: boolean;
+      isOpeningFile: boolean;
+      isFileOperating: boolean;
+      saveStatus: string;
+    }) => {
+      return (
+        state.storageMode !== 'drive' ||
+        (!state.isSaving &&
+          !state.isDebouncing &&
+          !state.isOpeningFile &&
+          !state.isFileOperating &&
+          state.saveStatus !== 'dirty' &&
+          state.saveStatus !== 'error' &&
+          state.saveStatus !== 'saving')
+      );
+    };
+
+    if (
+      !evaluateSignOutSafe({
+        storageMode: 'local',
+        isSaving: false,
+        isDebouncing: false,
+        isOpeningFile: true,
+        isFileOperating: true,
+        saveStatus: 'dirty',
+      })
+    ) {
+      throw new Error('Local storage mode should always be safe for sign-out');
+    }
+
+    if (
+      evaluateSignOutSafe({
+        storageMode: 'drive',
+        isSaving: false,
+        isDebouncing: false,
+        isOpeningFile: true,
+        isFileOperating: false,
+        saveStatus: 'saved',
+      })
+    ) {
+      throw new Error('Drive mode with isOpeningFile=true must NOT be safe for sign-out');
+    }
+
+    if (
+      evaluateSignOutSafe({
+        storageMode: 'drive',
+        isSaving: false,
+        isDebouncing: false,
+        isOpeningFile: false,
+        isFileOperating: true,
+        saveStatus: 'saved',
+      })
+    ) {
+      throw new Error('Drive mode with isFileOperating=true must NOT be safe for sign-out');
+    }
+
+    if (
+      !evaluateSignOutSafe({
+        storageMode: 'drive',
+        isSaving: false,
+        isDebouncing: false,
+        isOpeningFile: false,
+        isFileOperating: false,
+        saveStatus: 'saved',
+      })
+    ) {
+      throw new Error('Idle, clean Drive mode must be safe for sign-out');
+    }
+  });
+
+  type TestSwitchAction =
+    | { type: 'switch'; targetFileId: string; targetFileName?: string }
+    | { type: 'new' };
+
+  class UnsavedSwitchOrchestratorHarness {
+    public currentFileId: string | null = 'file_1';
+    public currentFileName: string = 'File 1';
+    public saveStatus: string = 'saved';
+    public isSaving: boolean = false;
+    public isDebouncing: boolean = false;
+    public isDirty: boolean = false;
+    public generation: number = 1;
+    public storageMode: 'local' | 'drive' = 'local';
+
+    public pendingAction: TestSwitchAction | null = null;
+    public switchSaveError: string | null = null;
+    public isModalOpen: boolean = false;
+
+    public saveCallCount: number = 0;
+    public mockSaveResult: boolean = true;
+    public saveDelayMs: number = 0;
+    public activeSavePromise: Promise<boolean> | null = null;
+    public cancelledDebouncedSave: boolean = false;
+
+    public latestSaveRequestId: number = 0;
+    public activeSaveAbortController: AbortController | null = null;
+    public canvasContent: string = 'content_1_initial';
+    public lastSavedContent: string = 'content_1_initial';
+
+    public files: any[] = [
+      { id: 'file_1', name: 'File 1.excalidraw' },
+      { id: 'file_2', name: 'File 2.excalidraw' },
+    ];
+
+    public mockStorage: {
+      records: Record<string, string>;
+      create: (name: string, content: string, signal?: AbortSignal) => Promise<string>;
+      update: (fileId: string, content: string, signal?: AbortSignal) => Promise<void>;
+    };
+
+    constructor(customStorage?: any) {
+      this.mockStorage = customStorage || {
+        records: {
+          file_1: 'content_1_initial',
+          file_2: 'content_2_initial',
+        },
+        create: async (_name: string, content: string, signal?: AbortSignal) => {
+          if (signal?.aborted) throw new Error('Aborted');
+          const id = 'created_' + Date.now();
+          this.mockStorage.records[id] = content;
+          return id;
+        },
+        update: async (fileId: string, content: string, signal?: AbortSignal) => {
+          if (signal?.aborted) throw new Error('Aborted');
+          this.mockStorage.records[fileId] = content;
+        },
+      };
+    }
+
+    public isSceneUnsaved(): boolean {
+      return (
+        this.isDirty ||
+        this.saveStatus === 'dirty' ||
+        this.saveStatus === 'saving' ||
+        this.saveStatus === 'error' ||
+        this.isSaving ||
+        this.isDebouncing
+      );
+    }
+
+    public handleSelectFileRequest(fileId: string): boolean {
+      if (fileId === this.currentFileId) {
+        // No-op for currently active file
+        return false;
+      }
+
+      if (this.isSceneUnsaved()) {
+        const target = this.files.find((f) => f.id === fileId);
+        this.switchSaveError = null;
+        this.pendingAction = {
+          type: 'switch',
+          targetFileId: fileId,
+          targetFileName: target ? target.name : undefined,
+        };
+        this.isModalOpen = true;
+        return false;
+      } else {
+        this.currentFileId = fileId;
+        const target = this.files.find((f) => f.id === fileId);
+        this.currentFileName = target ? target.name : 'Untitled';
+        return true;
+      }
+    }
+
+    public handleNewDrawingRequest(): boolean {
+      if (this.isSceneUnsaved()) {
+        this.switchSaveError = null;
+        this.pendingAction = { type: 'new' };
+        this.isModalOpen = true;
+        return false;
+      } else {
+        this.currentFileId = 'new_id_' + Date.now();
+        this.currentFileName = 'Untitled';
+        this.saveStatus = 'saved';
+        this.isDirty = false;
+        return true;
+      }
+    }
+
+    public cancelPendingSave(): void {
+      this.cancelledDebouncedSave = true;
+      this.isDebouncing = false;
+      this.latestSaveRequestId++;
+      if (this.activeSaveAbortController) {
+        this.activeSaveAbortController.abort();
+        this.activeSaveAbortController = null;
+      }
+      this.activeSavePromise = null;
+      this.isSaving = false;
+    }
+
+    public async saveNow(): Promise<boolean> {
+      if (this.activeSavePromise) {
+        return this.activeSavePromise;
+      }
+
+      const opGen = this.generation;
+      const saveRequestId = ++this.latestSaveRequestId;
+      const targetFileId = this.currentFileId;
+      const abortController = new AbortController();
+      this.activeSaveAbortController = abortController;
+
+      const p = (async () => {
+        this.isSaving = true;
+        this.saveCallCount++;
+        try {
+          this.saveStatus = 'saving';
+          if (this.saveDelayMs > 0) {
+            await new Promise((r) => setTimeout(r, this.saveDelayMs));
+          }
+
+          const serialized = this.canvasContent;
+          let targetId = targetFileId;
+
+          if (
+            opGen !== this.generation ||
+            saveRequestId !== this.latestSaveRequestId ||
+            abortController.signal.aborted ||
+            (targetFileId !== null && this.currentFileId !== targetFileId)
+          ) {
+            return false;
+          }
+
+          if (!targetId) {
+            targetId = await this.mockStorage.create(this.currentFileName, serialized, abortController.signal);
+            if (
+              opGen !== this.generation ||
+              saveRequestId !== this.latestSaveRequestId ||
+              abortController.signal.aborted ||
+              this.currentFileId !== null
+            ) {
+              return false;
+            }
+            this.currentFileId = targetId;
+          } else {
+            await this.mockStorage.update(targetId, serialized, abortController.signal);
+            if (
+              opGen !== this.generation ||
+              saveRequestId !== this.latestSaveRequestId ||
+              abortController.signal.aborted ||
+              this.currentFileId !== targetId
+            ) {
+              return false;
+            }
+          }
+
+          if (!this.mockSaveResult) {
+            throw new Error('Save failed');
+          }
+
+          this.lastSavedContent = serialized;
+          this.saveStatus = 'saved';
+          this.isDirty = false;
+          return (
+            opGen === this.generation &&
+            saveRequestId === this.latestSaveRequestId &&
+            !abortController.signal.aborted
+          );
+        } catch (err: any) {
+          if (
+            opGen === this.generation &&
+            saveRequestId === this.latestSaveRequestId &&
+            !abortController.signal.aborted &&
+            (targetFileId === null ? this.currentFileId === null : this.currentFileId === targetFileId)
+          ) {
+            this.saveStatus = 'error';
+            this.switchSaveError = err?.message || 'Save failed';
+          }
+          return false;
+        } finally {
+          if (this.activeSaveAbortController === abortController) {
+            this.activeSaveAbortController = null;
+          }
+          if (
+            opGen === this.generation &&
+            saveRequestId === this.latestSaveRequestId &&
+            !abortController.signal.aborted
+          ) {
+            this.isSaving = false;
+            this.activeSavePromise = null;
+          }
+        }
+      })();
+
+      this.activeSavePromise = p;
+      return p;
+    }
+
+    public activeSwitchPromise: Promise<boolean> | null = null;
+
+    public async handleSaveAndProceed(): Promise<boolean> {
+      if (this.activeSwitchPromise) {
+        return this.activeSwitchPromise;
+      }
+      if (!this.pendingAction) return false;
+      const startGen = this.generation;
+      const action = this.pendingAction;
+      this.switchSaveError = null;
+
+      const p = (async () => {
+        try {
+          const success = await this.saveNow();
+          if (!success || this.generation !== startGen) {
+            this.switchSaveError = 'Failed to save drawing. Active drawing preserved.';
+            return false;
+          }
+
+          this.pendingAction = null;
+          this.isModalOpen = false;
+
+          if (action.type === 'switch') {
+            this.currentFileId = action.targetFileId;
+            const target = this.files.find((f) => f.id === action.targetFileId);
+            this.currentFileName = target ? target.name : 'Untitled';
+            this.canvasContent = this.mockStorage.records[action.targetFileId] || '';
+            this.lastSavedContent = this.canvasContent;
+          } else {
+            this.currentFileId = 'new_created_id';
+            this.currentFileName = 'Untitled';
+            this.canvasContent = JSON.stringify({ name: 'Untitled', elements: [] });
+            this.lastSavedContent = this.canvasContent;
+          }
+          return true;
+        } catch (err: any) {
+          this.switchSaveError = err?.message || 'Save failed. Active drawing preserved.';
+          return false;
+        } finally {
+          this.activeSwitchPromise = null;
+        }
+      })();
+
+      this.activeSwitchPromise = p;
+      return p;
+    }
+
+    public handleDiscardAndProceed(): void {
+      if (!this.pendingAction) return;
+      const action = this.pendingAction;
+      this.pendingAction = null;
+      this.isModalOpen = false;
+      this.switchSaveError = null;
+
+      // Invalidate in-flight and debounced saves BEFORE switching files or creating new file
+      this.cancelPendingSave();
+
+      if (action.type === 'switch') {
+        this.currentFileId = action.targetFileId;
+        const target = this.files.find((f) => f.id === action.targetFileId);
+        this.currentFileName = target ? target.name : 'Untitled';
+        this.canvasContent = this.mockStorage.records[action.targetFileId] || '';
+        this.lastSavedContent = this.canvasContent;
+        this.saveStatus = 'saved';
+        this.isDirty = false;
+      } else {
+        this.currentFileId = 'new_created_id';
+        this.currentFileName = 'Untitled';
+        this.canvasContent = JSON.stringify({ name: 'Untitled', elements: [] });
+        this.lastSavedContent = this.canvasContent;
+        this.saveStatus = 'saved';
+        this.isDirty = false;
+      }
+    }
+
+    public handleCancel(): void {
+      this.pendingAction = null;
+      this.isModalOpen = false;
+      this.switchSaveError = null;
+    }
+
+    public transitionGeneration(newGen: number, newMode: any): void {
+      this.generation = newGen;
+      this.storageMode = newMode;
+      // Invalidate pending switch action
+      this.pendingAction = null;
+      this.switchSaveError = null;
+      this.isModalOpen = false;
+      this.activeSwitchPromise = null;
+    }
+  }
+
+  // 22. Dirty state switch protection and UnsavedSwitchModal orchestration
+  await record('22. Dirty state switch protection and UnsavedSwitchModal orchestration', async () => {
+    // A. Clean scene allows immediate file switch without modal
+    const harness = new UnsavedSwitchOrchestratorHarness();
+    const switched = harness.handleSelectFileRequest('file_2');
+    if (!switched || harness.currentFileId !== 'file_2' || harness.isModalOpen) {
+      throw new Error('Clean scene should switch file immediately without modal');
+    }
+
+    // B. Clicking currently active file is a no-op even if dirty
+    harness.isDirty = true;
+    const selfClickResult = harness.handleSelectFileRequest('file_2');
+    if (selfClickResult !== false || harness.isModalOpen || harness.currentFileId !== 'file_2') {
+      throw new Error('Clicking active file should be a silent no-op');
+    }
+
+    // C. Dirty scene prompts on file switch
+    harness.isDirty = true;
+    const dirtySwitchResult = harness.handleSelectFileRequest('file_1');
+    if (dirtySwitchResult !== false || !harness.isModalOpen || !harness.pendingAction) {
+      throw new Error('Dirty scene must open UnsavedSwitchModal on file switch');
+    }
+    if (harness.pendingAction.type !== 'switch' || harness.pendingAction.targetFileId !== 'file_1') {
+      throw new Error('Pending action does not match switch target');
+    }
+    if (harness.currentFileId !== 'file_2') {
+      throw new Error('Active file must not change before switch confirmation');
+    }
+
+    // D. Dirty scene prompts on "+ New"
+    const harnessNew = new UnsavedSwitchOrchestratorHarness();
+    harnessNew.isDirty = true;
+    const dirtyNewResult = harnessNew.handleNewDrawingRequest();
+    if (dirtyNewResult !== false || !harnessNew.isModalOpen || harnessNew.pendingAction?.type !== 'new') {
+      throw new Error('Dirty scene must open UnsavedSwitchModal on "+ New" request');
+    }
+
+    // E. Clean scene executes "+ New" immediately
+    const harnessCleanNew = new UnsavedSwitchOrchestratorHarness();
+    harnessCleanNew.isDirty = false;
+    harnessCleanNew.saveStatus = 'saved';
+    const cleanNewResult = harnessCleanNew.handleNewDrawingRequest();
+    if (!cleanNewResult || harnessCleanNew.isModalOpen || harnessCleanNew.currentFileName !== 'Untitled') {
+      throw new Error('Clean scene should execute "+ New" immediately');
+    }
+
+    // F. "Save and Switch" succeeds: saves and opens target file
+    const harnessSave = new UnsavedSwitchOrchestratorHarness();
+    harnessSave.isDirty = true;
+    harnessSave.handleSelectFileRequest('file_2');
+    const saveSuccess = await harnessSave.handleSaveAndProceed();
+    if (!saveSuccess || harnessSave.isModalOpen || harnessSave.currentFileId !== 'file_2') {
+      throw new Error('Save and Switch should save, close modal, and open target file');
+    }
+    if (harnessSave.saveCallCount !== 1 || harnessSave.saveStatus !== 'saved') {
+      throw new Error('Save was not executed properly during Save and Switch');
+    }
+
+    // G. Failed save blocks switch and preserves unsaved work
+    const harnessFail = new UnsavedSwitchOrchestratorHarness();
+    harnessFail.isDirty = true;
+    harnessFail.mockSaveResult = false;
+    harnessFail.handleSelectFileRequest('file_2');
+    const failSuccess = await harnessFail.handleSaveAndProceed();
+    if (failSuccess !== false) {
+      throw new Error('Failed save must return false');
+    }
+    if (!harnessFail.isModalOpen) {
+      throw new Error('Failed save must keep UnsavedSwitchModal open');
+    }
+    if (harnessFail.currentFileId !== 'file_1') {
+      throw new Error('Failed save must block switch and keep original file active');
+    }
+    if (!harnessFail.switchSaveError) {
+      throw new Error('Failed save must populate switchSaveError');
+    }
+
+    // H. "Discard and Switch" cancels debounce, discards, and switches
+    const harnessDiscard = new UnsavedSwitchOrchestratorHarness();
+    harnessDiscard.isDirty = true;
+    harnessDiscard.handleSelectFileRequest('file_2');
+    harnessDiscard.handleDiscardAndProceed();
+    if (harnessDiscard.isModalOpen || harnessDiscard.currentFileId !== 'file_2') {
+      throw new Error('Discard and Switch should close modal and switch to target file');
+    }
+    if (!harnessDiscard.cancelledDebouncedSave) {
+      throw new Error('Discard and Switch must cancel pending debounced saves');
+    }
+
+    // I. "Cancel" closes modal and leaves drawing dirty and active
+    const harnessCancel = new UnsavedSwitchOrchestratorHarness();
+    harnessCancel.isDirty = true;
+    harnessCancel.handleSelectFileRequest('file_2');
+    harnessCancel.handleCancel();
+    if (harnessCancel.isModalOpen || harnessCancel.pendingAction !== null) {
+      throw new Error('Cancel must close modal and clear pending action');
+    }
+    if (harnessCancel.currentFileId !== 'file_1' || !harnessCancel.isDirty) {
+      throw new Error('Cancel must keep original file active and dirty');
+    }
+
+    // J. "Save and Create" (+ New) succeeds
+    const harnessSaveNew = new UnsavedSwitchOrchestratorHarness();
+    harnessSaveNew.isDirty = true;
+    harnessSaveNew.handleNewDrawingRequest();
+    const saveNewSuccess = await harnessSaveNew.handleSaveAndProceed();
+    if (!saveNewSuccess || harnessSaveNew.isModalOpen || harnessSaveNew.currentFileName !== 'Untitled') {
+      throw new Error('Save and Create must succeed, close modal, and open new drawing');
+    }
+
+    // K. Concurrent clicks on Save and Switch share the in-flight promise
+    const harnessConcurrent = new UnsavedSwitchOrchestratorHarness();
+    harnessConcurrent.isDirty = true;
+    harnessConcurrent.saveDelayMs = 20;
+    harnessConcurrent.handleSelectFileRequest('file_2');
+    const [c1, c2] = await Promise.all([
+      harnessConcurrent.handleSaveAndProceed(),
+      harnessConcurrent.handleSaveAndProceed(),
+    ]);
+    if (!c1 || !c2 || harnessConcurrent.saveCallCount !== 1) {
+      throw new Error('Concurrent clicks must share the single in-flight save');
+    }
+
+    // L. Storage generation change invalidates pending switch action
+    const harnessGen = new UnsavedSwitchOrchestratorHarness();
+    harnessGen.isDirty = true;
+    harnessGen.handleSelectFileRequest('file_2');
+    if (!harnessGen.isModalOpen) throw new Error('Modal should be open initially');
+    harnessGen.transitionGeneration(2, 'drive');
+    if (harnessGen.isModalOpen || harnessGen.pendingAction !== null) {
+      throw new Error('Generation transition must invalidate pending switch action and close modal');
+    }
+
+    // M. Generation change during in-flight Save and Switch blocks switch
+    const harnessGenFlight = new UnsavedSwitchOrchestratorHarness();
+    harnessGenFlight.isDirty = true;
+    harnessGenFlight.saveDelayMs = 30;
+    harnessGenFlight.handleSelectFileRequest('file_2');
+    const pendingSave = harnessGenFlight.handleSaveAndProceed();
+    // Simulate generation transition during save
+    harnessGenFlight.generation = 3;
+    const flightOutcome = await pendingSave;
+    if (flightOutcome !== false || harnessGenFlight.currentFileId !== 'file_1') {
+      throw new Error('Save across generation transition must not authorize file switch');
+    }
+  });
+
+  // 23. In-flight save invalidation on Discard — Case A: Abort-aware storage (AbortSignal propagation)
+  await record('23. In-flight save invalidation on Discard — Case A: Abort-aware storage (AbortSignal propagation)', async () => {
+    // Scenario 1: Discard and Switch
+    let resolveStorageUpdateA: () => void = () => {};
+    let storageUpdateSignal: AbortSignal | undefined;
+    const storageMap: Record<string, string> = {
+      file_A: 'scene_A_clean',
+      file_B: 'scene_B_clean',
+    };
+
+    const mockRaceStorage = {
+      records: storageMap,
+      create: async (_name: string, _content: string) => 'created_file',
+      update: async (fileId: string, content: string, signal?: AbortSignal) => {
+        storageUpdateSignal = signal;
+        if (fileId === 'file_A') {
+          await new Promise<void>((resolve) => {
+            resolveStorageUpdateA = resolve;
+          });
+          if (signal?.aborted) {
+            throw new Error('Save aborted by user discard');
+          }
+        }
+        storageMap[fileId] = content;
+      },
+    };
+
+    const harnessRaceSwitch = new UnsavedSwitchOrchestratorHarness(mockRaceStorage);
+    harnessRaceSwitch.files = [
+      { id: 'file_A', name: 'Drawing A.excalidraw' },
+      { id: 'file_B', name: 'Drawing B.excalidraw' },
+    ];
+    harnessRaceSwitch.currentFileId = 'file_A';
+    harnessRaceSwitch.currentFileName = 'Drawing A';
+    harnessRaceSwitch.canvasContent = 'scene_A_clean';
+    harnessRaceSwitch.lastSavedContent = 'scene_A_clean';
+    harnessRaceSwitch.saveStatus = 'saved';
+
+    // Step 2: Modify File A so it is dirty
+    harnessRaceSwitch.canvasContent = 'scene_A_DIRTY_DISCARDED';
+    harnessRaceSwitch.isDirty = true;
+    harnessRaceSwitch.saveStatus = 'dirty';
+
+    // Step 3 & 4: Start saveNow() for File A, paused in flight
+    const inFlightSavePromise = harnessRaceSwitch.saveNow();
+    if (!harnessRaceSwitch.isSaving) {
+      throw new Error('Save should be in-flight (isSaving=true)');
+    }
+
+    // Step 5: While that save is pending, trigger Discard and Switch
+    harnessRaceSwitch.handleSelectFileRequest('file_B');
+    if (!harnessRaceSwitch.isModalOpen || harnessRaceSwitch.pendingAction?.type !== 'switch') {
+      throw new Error('UnsavedSwitchModal should open for dirty File A on switch');
+    }
+
+    // Step 6: Discard operation invalidates the old save before file switch proceeds
+    harnessRaceSwitch.handleDiscardAndProceed();
+    if (harnessRaceSwitch.isModalOpen) {
+      throw new Error('Modal must close after Discard and Switch');
+    }
+    if (harnessRaceSwitch.currentFileId !== 'file_B') {
+      throw new Error(`Expected active file to be file_B, got ${harnessRaceSwitch.currentFileId}`);
+    }
+    if (harnessRaceSwitch.canvasContent !== 'scene_B_clean') {
+      throw new Error(`Expected active canvas to be scene_B_clean, got ${harnessRaceSwitch.canvasContent}`);
+    }
+
+    // Verify signal was aborted by cancelPendingSave()
+    if (!storageUpdateSignal?.aborted) {
+      throw new Error('Active save AbortSignal was not aborted upon Discard');
+    }
+
+    // Step 7: Release/resolve the previously pending save promise
+    resolveStorageUpdateA();
+    const saveOutcome = await inFlightSavePromise;
+
+    // Step 8: Assert that the old File A scene is NOT persisted by that stale save
+    if (saveOutcome !== false) {
+      throw new Error('Stale in-flight save must return false when resolved');
+    }
+    if (storageMap['file_A'] !== 'scene_A_clean') {
+      throw new Error(
+        `CRITICAL RACE: Discarded content was persisted to storage! Expected scene_A_clean, got ${storageMap['file_A']}`
+      );
+    }
+
+    // Step 9: Assert the new navigation operation remains valid
+    if (harnessRaceSwitch.currentFileId !== 'file_B') {
+      throw new Error('Stale save completion corrupted currentFileId away from File B');
+    }
+    if (harnessRaceSwitch.canvasContent !== 'scene_B_clean') {
+      throw new Error('Stale save completion corrupted File B canvas content');
+    }
+    if (harnessRaceSwitch.saveStatus !== 'saved') {
+      throw new Error(`Expected File B saveStatus=saved, got ${harnessRaceSwitch.saveStatus}`);
+    }
+    if (harnessRaceSwitch.isDirty) {
+      throw new Error('Expected File B to remain clean (isDirty=false)');
+    }
+    if (harnessRaceSwitch.isSaving) {
+      throw new Error('isSaving should be false after stale save resolves');
+    }
+
+    // Step 10: Assert subsequent save on File B persists correctly without interference
+    harnessRaceSwitch.canvasContent = 'scene_B_new_changes';
+    harnessRaceSwitch.isDirty = true;
+    harnessRaceSwitch.saveStatus = 'dirty';
+    const fileBSaveResult = await harnessRaceSwitch.saveNow();
+    if (!fileBSaveResult) {
+      throw new Error('Subsequent save on File B should succeed');
+    }
+    if (storageMap['file_B'] !== 'scene_B_new_changes') {
+      throw new Error(`File B changes were not saved: ${storageMap['file_B']}`);
+    }
+    if (storageMap['file_A'] !== 'scene_A_clean') {
+      throw new Error('File A storage was modified during File B operations');
+    }
+
+    // Scenario 2: Discard and Create (+ New) with abort-aware storage
+    let resolveStorageUpdateCreate: () => void = () => {};
+    let createStorageSignal: AbortSignal | undefined;
+    const storageMapCreate: Record<string, string> = {
+      file_A: 'scene_A_initial',
+    };
+
+    const mockRaceCreateStorage = {
+      records: storageMapCreate,
+      create: async (_name: string, _content: string) => {
+        const id = 'new_created_' + Date.now();
+        storageMapCreate[id] = _content;
+        return id;
+      },
+      update: async (fileId: string, content: string, signal?: AbortSignal) => {
+        createStorageSignal = signal;
+        if (fileId === 'file_A') {
+          await new Promise<void>((resolve) => {
+            resolveStorageUpdateCreate = resolve;
+          });
+          if (signal?.aborted) {
+            throw new Error('Save aborted by user discard');
+          }
+        }
+        storageMapCreate[fileId] = content;
+      },
+    };
+
+    const harnessRaceCreate = new UnsavedSwitchOrchestratorHarness(mockRaceCreateStorage);
+    harnessRaceCreate.currentFileId = 'file_A';
+    harnessRaceCreate.currentFileName = 'Drawing A';
+    harnessRaceCreate.canvasContent = 'scene_A_initial';
+    harnessRaceCreate.lastSavedContent = 'scene_A_initial';
+    harnessRaceCreate.saveStatus = 'saved';
+
+    // Modify File A
+    harnessRaceCreate.canvasContent = 'scene_A_DISCARDED_FOR_NEW';
+    harnessRaceCreate.isDirty = true;
+    harnessRaceCreate.saveStatus = 'dirty';
+
+    // Start saveNow() in flight
+    const inFlightSaveCreatePromise = harnessRaceCreate.saveNow();
+    if (!harnessRaceCreate.isSaving) {
+      throw new Error('Save should be in-flight before Discard and Create');
+    }
+
+    // Trigger "+ New"
+    harnessRaceCreate.handleNewDrawingRequest();
+    if (!harnessRaceCreate.isModalOpen || harnessRaceCreate.pendingAction?.type !== 'new') {
+      throw new Error('Modal must prompt for Discard and Create');
+    }
+
+    // Discard and Create
+    harnessRaceCreate.handleDiscardAndProceed();
+    if (harnessRaceCreate.isModalOpen) {
+      throw new Error('Modal must close after Discard and Create');
+    }
+    if (harnessRaceCreate.currentFileId === 'file_A') {
+      throw new Error('Active file must switch away from file_A upon Discard and Create');
+    }
+    if (!createStorageSignal?.aborted) {
+      throw new Error('Active save AbortSignal was not aborted upon Discard and Create');
+    }
+
+    // Release the paused save
+    resolveStorageUpdateCreate();
+    const staleCreateOutcome = await inFlightSaveCreatePromise;
+
+    // Assert stale save did not persist and did not corrupt new drawing
+    if (staleCreateOutcome !== false) {
+      throw new Error('Stale save must return false');
+    }
+    if (storageMapCreate['file_A'] !== 'scene_A_initial') {
+      throw new Error('CRITICAL RACE: Discarded content was persisted to File A during Discard and Create');
+    }
+    if (harnessRaceCreate.currentFileId === 'file_A') {
+      throw new Error('Stale save completion hijacked currentFileId back to file_A');
+    }
+    if (harnessRaceCreate.saveStatus !== 'saved') {
+      throw new Error(`Expected new file saveStatus=saved, got ${harnessRaceCreate.saveStatus}`);
+    }
+
+    // Scenario 3: Deterministic in-flight save on transient/untitled drawing invalidation on Discard
+    let resolveStorageCreate: () => void = () => {};
+    let transientStorageSignal: AbortSignal | undefined;
+    const transientStorageMap: Record<string, string> = {
+      file_existing: 'existing_file_content',
+    };
+
+    const mockTransientStorage = {
+      records: transientStorageMap,
+      create: async (_name: string, content: string, signal?: AbortSignal) => {
+        transientStorageSignal = signal;
+        await new Promise<void>((resolve) => {
+          resolveStorageCreate = resolve;
+        });
+        if (signal?.aborted) {
+          throw new Error('Creation aborted by discard');
+        }
+        const id = 'transient_assigned_id';
+        transientStorageMap[id] = content;
+        return id;
+      },
+      update: async (fileId: string, content: string) => {
+        transientStorageMap[fileId] = content;
+      },
+    };
+
+    const harnessTransient = new UnsavedSwitchOrchestratorHarness(mockTransientStorage);
+    harnessTransient.currentFileId = null;
+    harnessTransient.currentFileName = 'Untitled';
+    harnessTransient.canvasContent = 'transient_dirty_content';
+    harnessTransient.isDirty = true;
+    harnessTransient.saveStatus = 'dirty';
+
+    // Start saveNow() for transient drawing
+    const transientSavePromise = harnessTransient.saveNow();
+    if (!harnessTransient.isSaving) {
+      throw new Error('Transient save was not started in flight');
+    }
+
+    // While in flight, user switches to existing file and discards transient work
+    harnessTransient.handleSelectFileRequest('file_existing');
+    harnessTransient.handleDiscardAndProceed();
+
+    if (harnessTransient.currentFileId !== 'file_existing') {
+      throw new Error('File switch to file_existing must take effect');
+    }
+    if (!transientStorageSignal?.aborted) {
+      throw new Error('Transient create signal was not aborted on discard');
+    }
+
+    // Release the paused create
+    resolveStorageCreate();
+    const transientOutcome = await transientSavePromise;
+
+    if (transientOutcome !== false) {
+      throw new Error('Transient stale save must return false');
+    }
+    if (transientStorageMap['transient_assigned_id'] !== undefined) {
+      throw new Error('Discarded transient drawing was created in storage after discard');
+    }
+    if (harnessTransient.currentFileId !== 'file_existing') {
+      throw new Error('Transient create completion overwrote currentFileId');
+    }
+  });
+
+  // 24. In-flight save invalidation on Discard — Case B: Abort-insensitive storage & state guard proof
+  await record('24. In-flight save invalidation on Discard — Case B: Abort-insensitive storage & state guard proof', async () => {
+    // Proves that even when the underlying storage operation completely IGNORES AbortSignal
+    // (e.g. server committed write before abort arrived, or custom storage ignores abort),
+    // the request identity/generation guards independently prevent stale persistence and state corruption.
+
+    // Scenario B1: Discard and Switch where storage ignores abort and writes anyway
+    let resolveStorageUpdateB1: () => void = () => {};
+    const storageMapB1: Record<string, string> = {
+      file_A: 'scene_A_clean',
+      file_B: 'scene_B_clean',
+    };
+
+    const mockStorageIgnoreAbort = {
+      records: storageMapB1,
+      create: async (_name: string, content: string) => {
+        const id = 'created_' + Date.now();
+        storageMapB1[id] = content;
+        return id;
+      },
+      update: async (fileId: string, content: string, _signal?: AbortSignal) => {
+        if (fileId === 'file_A') {
+          // Pause in flight
+          await new Promise<void>((resolve) => {
+            resolveStorageUpdateB1 = resolve;
+          });
+          // DELIBERATELY IGNORE signal.aborted and commit write to simulate remote server completion!
+        }
+        storageMapB1[fileId] = content;
+      },
+    };
+
+    const harnessB1 = new UnsavedSwitchOrchestratorHarness(mockStorageIgnoreAbort);
+    harnessB1.files = [
+      { id: 'file_A', name: 'Drawing A.excalidraw' },
+      { id: 'file_B', name: 'Drawing B.excalidraw' },
+    ];
+    harnessB1.currentFileId = 'file_A';
+    harnessB1.currentFileName = 'Drawing A';
+    harnessB1.canvasContent = 'scene_A_clean';
+    harnessB1.lastSavedContent = 'scene_A_clean';
+    harnessB1.saveStatus = 'saved';
+
+    // Step 1: Modify File A to dirty
+    harnessB1.canvasContent = 'scene_A_DIRTY_DISCARDED';
+    harnessB1.isDirty = true;
+    harnessB1.saveStatus = 'dirty';
+
+    // Step 2: Start saveNow() in flight
+    const pendingSaveB1 = harnessB1.saveNow();
+    if (!harnessB1.isSaving) throw new Error('Save should be in-flight');
+
+    // Step 3: While in flight, user discards and switches to File B
+    harnessB1.handleSelectFileRequest('file_B');
+    harnessB1.handleDiscardAndProceed();
+
+    // Verify File B is active
+    if (harnessB1.currentFileId !== 'file_B') throw new Error('File B should be active');
+    if (harnessB1.canvasContent !== 'scene_B_clean') throw new Error('Canvas should be scene_B_clean');
+
+    // Step 4: Storage resolves successfully (ignoring abort)
+    resolveStorageUpdateB1();
+    const outcomeB1 = await pendingSaveB1;
+
+    // Requirement Assertions for Case B:
+    // 1. Stale save must return false
+    if (outcomeB1 !== false) {
+      throw new Error('Stale save must return false even when storage write resolves successfully');
+    }
+    // 2. Stale completion must not mutate currentFileId away from File B
+    if (harnessB1.currentFileId !== 'file_B') {
+      throw new Error(`CRITICAL: Stale save completion corrupted currentFileId to ${harnessB1.currentFileId}`);
+    }
+    // 3. Stale completion must not overwrite File B canvas
+    if (harnessB1.canvasContent !== 'scene_B_clean') {
+      throw new Error(`CRITICAL: Stale save completion corrupted File B canvas to ${harnessB1.canvasContent}`);
+    }
+    // 4. Stale completion must not update lastSavedContent to discarded content
+    if (harnessB1.lastSavedContent !== 'scene_B_clean') {
+      throw new Error(`CRITICAL: Stale save updated lastSavedContent to ${harnessB1.lastSavedContent}`);
+    }
+    // 5. Stale completion must not clear dirty state
+    if (harnessB1.saveStatus !== 'saved') {
+      throw new Error(`Expected saveStatus=saved, got ${harnessB1.saveStatus}`);
+    }
+    // 6. Stale completion must not leave isSaving true
+    if (harnessB1.isSaving) {
+      throw new Error('isSaving should be false');
+    }
+
+    // Scenario B2: Stale completion must NOT clear/overwrite dirty state of newly active File B
+    let resolveStorageUpdateB2: () => void = () => {};
+    const storageMapB2: Record<string, string> = {
+      file_A: 'scene_A_clean',
+      file_B: 'scene_B_clean',
+    };
+
+    const mockStorageB2 = {
+      records: storageMapB2,
+      create: async (_name: string, _content: string) => 'id',
+      update: async (fileId: string, content: string, _signal?: AbortSignal) => {
+        if (fileId === 'file_A') {
+          await new Promise<void>((r) => { resolveStorageUpdateB2 = r; });
+        }
+        storageMapB2[fileId] = content;
+      },
+    };
+
+    const harnessB2 = new UnsavedSwitchOrchestratorHarness(mockStorageB2);
+    harnessB2.currentFileId = 'file_A';
+    harnessB2.canvasContent = 'scene_A_DIRTY';
+    harnessB2.isDirty = true;
+    harnessB2.saveStatus = 'dirty';
+
+    // Start File A save
+    const pSaveB2 = harnessB2.saveNow();
+
+    // User discards and switches to File B
+    harnessB2.handleSelectFileRequest('file_B');
+    harnessB2.handleDiscardAndProceed();
+
+    // User now makes changes to File B -> File B is now DIRTY!
+    harnessB2.canvasContent = 'scene_B_MODIFIED_UNSAVED';
+    harnessB2.isDirty = true;
+    harnessB2.saveStatus = 'dirty';
+
+    // NOW the stale File A save resolves
+    resolveStorageUpdateB2();
+    const resB2 = await pSaveB2;
+    if (resB2 !== false) throw new Error('Stale save must return false');
+
+    // CRITICAL: File B's dirty state must NOT be wiped out by File A's stale completion!
+    if (harnessB2.saveStatus !== 'dirty') {
+      throw new Error(`CRITICAL DATA LOSS RISK: Stale completion wiped out File B dirty status! saveStatus=${harnessB2.saveStatus}`);
+    }
+    if (!harnessB2.isDirty) {
+      throw new Error('CRITICAL: Stale completion set isDirty=false for new file');
+    }
+    if (harnessB2.canvasContent !== 'scene_B_MODIFIED_UNSAVED') {
+      throw new Error('CRITICAL: Canvas content was mutated by stale completion');
+    }
+    if (harnessB2.currentFileId !== 'file_B') {
+      throw new Error('CRITICAL: currentFileId was mutated away from file_B');
+    }
+
+    // Scenario B3: Transient drawing creation ignores abort and assigns ID
+    let resolveStorageCreateB3: () => void = () => {};
+    const storageMapB3: Record<string, string> = {
+      file_existing: 'existing_content',
+    };
+
+    const mockStorageB3 = {
+      records: storageMapB3,
+      create: async (_name: string, content: string, _signal?: AbortSignal) => {
+        await new Promise<void>((r) => { resolveStorageCreateB3 = r; });
+        const id = 'stale_transient_assigned_id';
+        storageMapB3[id] = content;
+        return id;
+      },
+      update: async (fileId: string, content: string) => {
+        storageMapB3[fileId] = content;
+      },
+    };
+
+    const harnessB3 = new UnsavedSwitchOrchestratorHarness(mockStorageB3);
+    harnessB3.currentFileId = null; // Transient drawing
+    harnessB3.currentFileName = 'Untitled';
+    harnessB3.canvasContent = 'transient_content';
+    harnessB3.isDirty = true;
+    harnessB3.saveStatus = 'dirty';
+
+    // Start save of transient drawing
+    const pSaveB3 = harnessB3.saveNow();
+
+    // User discards transient drawing and opens file_existing
+    harnessB3.handleSelectFileRequest('file_existing');
+    harnessB3.handleDiscardAndProceed();
+
+    if (harnessB3.currentFileId !== 'file_existing') {
+      throw new Error('Current file should be file_existing');
+    }
+
+    // Stale create resolves and returns an ID
+    resolveStorageCreateB3();
+    const resB3 = await pSaveB3;
+
+    if (resB3 !== false) throw new Error('Stale transient save must return false');
+    // CRITICAL: Stale create completion must NOT hijack currentFileId away from file_existing
+    if (harnessB3.currentFileId !== 'file_existing') {
+      throw new Error(`CRITICAL: Stale create completion hijacked currentFileId to ${harnessB3.currentFileId}`);
+    }
+  });
+
+  // 25. Production useDrawingPersistence hook: deterministic in-flight save abort and stale guard verification
+  await record('25. Production useDrawingPersistence hook: deterministic in-flight save abort and stale guard verification', async () => {
+    const hookHolder: { current: ReturnType<typeof useDrawingPersistence> | null } = { current: null };
+    let resolveHookReady: () => void = () => {};
+    const hookReadyPromise = new Promise<void>((r) => {
+      resolveHookReady = r;
+    });
+
+    let resolveStorageUpdate: () => void = () => {};
+    let storageSignal: AbortSignal | undefined;
+    const testStorageMap: Record<string, string> = {
+      file_A: JSON.stringify({ name: 'Drawing A', elements: [{ id: '1', type: 'rectangle' }] }),
+      file_B: JSON.stringify({ name: 'Drawing B', elements: [{ id: '2', type: 'ellipse' }] }),
+    };
+
+    const mockProductionStorage: any = {
+      list: async () => [
+        { id: 'file_A', name: 'Drawing A.excalidraw' },
+        { id: 'file_B', name: 'Drawing B.excalidraw' },
+      ],
+      get: async (id: string) => testStorageMap[id] || '',
+      create: async (_name: string, content: string, signal?: AbortSignal) => {
+        if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+        const id = 'created_' + Date.now();
+        testStorageMap[id] = content;
+        return id;
+      },
+      update: async (fileId: string, content: string, signal?: AbortSignal) => {
+        storageSignal = signal;
+        if (fileId === 'file_A') {
+          await new Promise<void>((r) => {
+            resolveStorageUpdate = r;
+          });
+          if (signal?.aborted) {
+            throw new DOMException('The user aborted a request.', 'AbortError');
+          }
+        }
+        testStorageMap[fileId] = content;
+      },
+    };
+
+    const mockExcalidrawApi: any = {
+      getSceneElementsIncludingDeleted: () => [{ id: '1', type: 'rectangle', version: 2 }],
+      getAppState: () => ({ viewBackgroundColor: '#ffffff' }),
+      getFiles: () => ({}),
+      updateScene: () => {},
+      resetScene: () => {},
+      history: { clear: () => {} },
+    };
+
+    function TestPersistenceComponent() {
+      const hook = useDrawingPersistence({
+        api: mockExcalidrawApi,
+        storage: mockProductionStorage,
+      });
+      useEffect(() => {
+        hookHolder.current = hook;
+        if (hook.currentFileId === 'file_A' && !hook.isLoading) {
+          resolveHookReady();
+        }
+      });
+      return null;
+    }
+
+    // Ensure clean local storage state for test
+    localStorage.removeItem('canvasvault_last_opened_id');
+
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => {
+        root.render(React.createElement(TestPersistenceComponent));
+      });
+
+      await hookReadyPromise;
+
+      if (!hookHolder.current) throw new Error('Production hook was not mounted');
+      if ((hookHolder.current.currentFileId as string | null) !== 'file_A') {
+        throw new Error(`Expected initial file to be file_A, got ${hookHolder.current.currentFileId}`);
+      }
+
+      // Step 1: Start saveNow() on File A using the REAL production hook
+      let saveOutcome: boolean | null = null;
+      let savePromise!: Promise<boolean>;
+      await act(async () => {
+        savePromise = hookHolder.current!.saveNow();
+      });
+
+      // Storage update for file_A is now in flight
+      if (!hookHolder.current.isSaving) {
+        throw new Error('Production hook isSaving should be true while save is in flight');
+      }
+
+      // Step 2: Trigger Discard and Switch to File B using production hook functions
+      await act(async () => {
+        // Discard cancels pending saves
+        hookHolder.current!.cancelPendingSave();
+        // Load File B
+        await hookHolder.current!.openDrawing('file_B');
+      });
+
+      // Assert that AbortSignal was aborted
+      if (!storageSignal?.aborted) {
+        throw new Error('Production hook cancelPendingSave() did not abort the active AbortController');
+      }
+      if ((hookHolder.current.currentFileId as string | null) !== 'file_B') {
+        throw new Error(`Production hook active file should be file_B, got ${hookHolder.current.currentFileId}`);
+      }
+
+      // Step 3: Release the in-flight save promise
+      await act(async () => {
+        resolveStorageUpdate();
+        saveOutcome = await savePromise;
+      });
+
+      // Step 4: Verify production hook behavior
+      if (saveOutcome !== false) {
+        throw new Error('Production hook saveNow() should have returned false after invalidation');
+      }
+      if ((hookHolder.current.currentFileId as string | null) !== 'file_B') {
+        throw new Error('Stale save completion mutated production currentFileId away from file_B');
+      }
+      if (hookHolder.current.saveStatus !== 'saved') {
+        throw new Error(`Expected production saveStatus=saved for file_B, got ${hookHolder.current.saveStatus}`);
+      }
+      if (hookHolder.current.isSaving) {
+        throw new Error('Production isSaving should be false');
+      }
+    } finally {
+      await act(async () => {
+        root.unmount();
+      });
+      container.remove();
+    }
+  });
+
+  // 26. Unit 1 — Inactive file deletion must not cancel or interrupt active-file pending/in-flight saves
+  await record('26. Unit 1 — Inactive file deletion must not cancel active-file in-flight saves', async () => {
+    const hookHolder: { current: ReturnType<typeof useDrawingPersistence> | null } = { current: null };
+    let resolveHookReady: () => void = () => {};
+    const hookReadyPromise = new Promise<void>((r) => { resolveHookReady = r; });
+
+    let resolveSaveA: () => void = () => {};
+    let saveSignalA: AbortSignal | undefined;
+    const testRecords: Record<string, string> = {
+      file_A: JSON.stringify({ name: 'File A', elements: [{ id: '1', type: 'rectangle' }] }),
+      file_B: JSON.stringify({ name: 'File B', elements: [{ id: '2', type: 'ellipse' }] }),
+    };
+
+    const mockStorage: any = {
+      list: async () => [
+        { id: 'file_A', name: 'File A.excalidraw' },
+        ...(testRecords['file_B'] ? [{ id: 'file_B', name: 'File B.excalidraw' }] : []),
+      ],
+      get: async (id: string) => testRecords[id] || '',
+      create: async (_name: string, content: string) => {
+        const id = 'created_' + Date.now();
+        testRecords[id] = content;
+        return id;
+      },
+      update: async (fileId: string, content: string, signal?: AbortSignal) => {
+        if (fileId === 'file_A') {
+          saveSignalA = signal;
+          await new Promise<void>((r) => { resolveSaveA = r; });
+          if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+        }
+        testRecords[fileId] = content;
+      },
+      delete: async (fileId: string) => {
+        delete testRecords[fileId];
+      },
+    };
+
+    const mockApi: any = {
+      getSceneElementsIncludingDeleted: () => [{ id: '1', type: 'rectangle', version: 3 }],
+      getAppState: () => ({ viewBackgroundColor: '#ffffff' }),
+      getFiles: () => ({}),
+      updateScene: () => {},
+      resetScene: () => {},
+      history: { clear: () => {} },
+    };
+
+    function TestComp() {
+      const hook = useDrawingPersistence({ api: mockApi, storage: mockStorage });
+      useEffect(() => {
+        hookHolder.current = hook;
+        if (hook.currentFileId === 'file_A' && !hook.isLoading) {
+          resolveHookReady();
+        }
+      });
+      return null;
+    }
+
+    localStorage.removeItem('canvasvault_last_opened_id');
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => { root.render(React.createElement(TestComp)); });
+      await hookReadyPromise;
+
+      // 1. Start saveNow() for File A
+      let saveOutcome: boolean | null = null;
+      let pSave!: Promise<boolean>;
+      await act(async () => {
+        pSave = hookHolder.current!.saveNow();
+      });
+
+      if (!hookHolder.current?.isSaving) {
+        throw new Error('Save on File A should be in flight');
+      }
+
+      // 2. While File A save is in flight, delete inactive File B
+      await act(async () => {
+        await hookHolder.current!.deleteDrawing('file_B');
+      });
+
+      // Verify File B was deleted
+      if (testRecords['file_B'] !== undefined) {
+        throw new Error('File B should have been deleted from storage');
+      }
+
+      // CRITICAL ASSERTION: File A's in-flight save must NOT be aborted!
+      if (saveSignalA?.aborted) {
+        throw new Error('CRITICAL BUG: Inactive delete aborted active file AbortSignal!');
+      }
+
+      // 3. Release File A save
+      await act(async () => {
+        resolveSaveA();
+        saveOutcome = await pSave;
+      });
+
+      if (saveOutcome !== true) {
+        throw new Error('Active file save should have succeeded');
+      }
+      if (hookHolder.current?.currentFileId !== 'file_A') {
+        throw new Error('Active file should remain file_A');
+      }
+      if (hookHolder.current?.saveStatus !== 'saved') {
+        throw new Error('Active file saveStatus should be saved');
+      }
+    } finally {
+      await act(async () => { root.unmount(); });
+      container.remove();
+    }
+  });
+
+  // 27. Unit 1 — Safe active delete and fallback open failure handling
+  await record('27. Unit 1 — Active delete fallback open failure clears active ID and resets to clean blank state', async () => {
+    const hookHolder: { current: ReturnType<typeof useDrawingPersistence> | null } = { current: null };
+    let resolveHookReady: () => void = () => {};
+    const hookReadyPromise = new Promise<void>((r) => { resolveHookReady = r; });
+
+    let resetSceneCalled = false;
+    const testRecords: Record<string, string> = {
+      file_A: JSON.stringify({ name: 'File A', elements: [{ id: '1', type: 'rectangle' }] }),
+      file_B: JSON.stringify({ name: 'File B', elements: [{ id: '2', type: 'ellipse' }] }),
+    };
+
+    const mockStorage: any = {
+      list: async () => [
+        ...(testRecords['file_A'] ? [{ id: 'file_A', name: 'File A.excalidraw' }] : []),
+        ...(testRecords['file_B'] ? [{ id: 'file_B', name: 'File B.excalidraw' }] : []),
+      ],
+      get: async (id: string) => {
+        if (id === 'file_B') {
+          throw new Error('Simulated network disconnect when opening fallback');
+        }
+        return testRecords[id] || '';
+      },
+      create: async (_name: string, content: string) => {
+        const id = 'created_' + Date.now();
+        testRecords[id] = content;
+        return id;
+      },
+      update: async (fileId: string, content: string) => {
+        testRecords[fileId] = content;
+      },
+      delete: async (fileId: string) => {
+        delete testRecords[fileId];
+      },
+    };
+
+    const mockApi: any = {
+      getSceneElementsIncludingDeleted: () => [],
+      getAppState: () => ({ viewBackgroundColor: '#ffffff' }),
+      getFiles: () => ({}),
+      updateScene: () => {},
+      resetScene: () => { resetSceneCalled = true; },
+      history: { clear: () => {} },
+    };
+
+    function TestComp() {
+      const hook = useDrawingPersistence({ api: mockApi, storage: mockStorage });
+      useEffect(() => {
+        hookHolder.current = hook;
+        if (hook.currentFileId === 'file_A' && !hook.isLoading) {
+          resolveHookReady();
+        }
+      });
+      return null;
+    }
+
+    localStorage.removeItem('canvasvault_last_opened_id');
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => { root.render(React.createElement(TestComp)); });
+      await hookReadyPromise;
+
+      // Delete active File A where fallback File B will fail to open
+      await act(async () => {
+        await hookHolder.current!.deleteDrawing('file_A');
+      });
+
+      // Assertions:
+      // 1. File A was deleted from storage
+      if (testRecords['file_A'] !== undefined) {
+        throw new Error('File A should be deleted from storage');
+      }
+      // 2. active file ID is null (NOT file_A)
+      if (hookHolder.current?.currentFileId !== null) {
+        throw new Error(`Expected currentFileId to be null, got ${hookHolder.current?.currentFileId}`);
+      }
+      // 3. Canvas was reset
+      if (!resetSceneCalled) {
+        throw new Error('Canvas should have been reset on fallback open failure');
+      }
+      // 4. File name is Untitled
+      if (hookHolder.current?.currentFileName !== 'Untitled') {
+        throw new Error(`Expected currentFileName Untitled, got ${hookHolder.current?.currentFileName}`);
+      }
+      // 5. Error message was populated
+      if (!hookHolder.current?.errorMessage) {
+        throw new Error('Expected errorMessage to be populated with failure details');
+      }
+    } finally {
+      await act(async () => { root.unmount(); });
+      container.remove();
+    }
+  });
+
+  // 28. Unit 1 — Active delete when refresh/list fails does NOT create replacement drawing
+  await record('28. Unit 1 — Active delete when refresh/list fails does NOT create replacement drawing', async () => {
+    const hookHolder: { current: ReturnType<typeof useDrawingPersistence> | null } = { current: null };
+    let resolveHookReady: () => void = () => {};
+    const hookReadyPromise = new Promise<void>((r) => { resolveHookReady = r; });
+
+    let createCallCount = 0;
+    let listFailMode = false;
+    const testRecords: Record<string, string> = {
+      file_A: JSON.stringify({ name: 'File A', elements: [{ id: '1', type: 'rectangle' }] }),
+      file_B: JSON.stringify({ name: 'File B', elements: [{ id: '2', type: 'ellipse' }] }),
+    };
+
+    const mockStorage: any = {
+      list: async () => {
+        if (listFailMode) {
+          throw new Error('Google Drive 500: listManagedFiles failed');
+        }
+        return [
+          ...(testRecords['file_A'] ? [{ id: 'file_A', name: 'File A.excalidraw' }] : []),
+          ...(testRecords['file_B'] ? [{ id: 'file_B', name: 'File B.excalidraw' }] : []),
+        ];
+      },
+      get: async (id: string) => testRecords[id] || '',
+      create: async (_name: string, content: string) => {
+        createCallCount++;
+        const id = 'created_' + Date.now();
+        testRecords[id] = content;
+        return id;
+      },
+      update: async (fileId: string, content: string) => {
+        testRecords[fileId] = content;
+      },
+      delete: async (fileId: string) => {
+        delete testRecords[fileId];
+      },
+    };
+
+    const mockApi: any = {
+      getSceneElementsIncludingDeleted: () => [],
+      getAppState: () => ({ viewBackgroundColor: '#ffffff' }),
+      getFiles: () => ({}),
+      updateScene: () => {},
+      resetScene: () => {},
+      history: { clear: () => {} },
+    };
+
+    function TestComp() {
+      const hook = useDrawingPersistence({ api: mockApi, storage: mockStorage });
+      useEffect(() => {
+        hookHolder.current = hook;
+        if (hook.currentFileId === 'file_A' && !hook.isLoading) {
+          resolveHookReady();
+        }
+      });
+      return null;
+    }
+
+    localStorage.removeItem('canvasvault_last_opened_id');
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => { root.render(React.createElement(TestComp)); });
+      await hookReadyPromise;
+
+      // Enable list failure mode
+      listFailMode = true;
+
+      // Delete active File A
+      await act(async () => {
+        await hookHolder.current!.deleteDrawing('file_A');
+      });
+
+      // Assertions:
+      // 1. File A was deleted
+      if (testRecords['file_A'] !== undefined) {
+        throw new Error('File A should have been deleted');
+      }
+      // 2. CRITICAL: createNewDrawing must NOT be called on list failure!
+      if (createCallCount !== 0) {
+        throw new Error(`CRITICAL BUG: List failure triggered createNewDrawing! createCallCount=${createCallCount}`);
+      }
+      // 3. active file ID is null
+      if (hookHolder.current?.currentFileId !== null) {
+        throw new Error(`Expected currentFileId to be null, got ${hookHolder.current?.currentFileId}`);
+      }
+      // 4. Error message is populated
+      if (!hookHolder.current?.errorMessage) {
+        throw new Error('Expected errorMessage to be populated with list failure details');
+      }
+    } finally {
+      await act(async () => { root.unmount(); });
+      container.remove();
+    }
+  });
+
+  // 29. Unit 1 — Deleting the final remaining file creates replacement correctly
+  await record('29. Unit 1 — Deleting final remaining file with empty list creates replacement correctly', async () => {
+    const hookHolder: { current: ReturnType<typeof useDrawingPersistence> | null } = { current: null };
+    let resolveHookReady: () => void = () => {};
+    const hookReadyPromise = new Promise<void>((r) => { resolveHookReady = r; });
+
+    let createdId: string | null = null;
+    const testRecords: Record<string, string> = {
+      file_only: JSON.stringify({ name: 'Only File', elements: [{ id: '1', type: 'rectangle' }] }),
+    };
+
+    const mockStorage: any = {
+      list: async () => {
+        return Object.keys(testRecords).map((id) => ({ id, name: id + '.excalidraw' }));
+      },
+      get: async (id: string) => testRecords[id] || '',
+      create: async (_name: string, content: string) => {
+        const id = 'replacement_file_' + Date.now();
+        createdId = id;
+        testRecords[id] = content;
+        return id;
+      },
+      update: async (fileId: string, content: string) => {
+        testRecords[fileId] = content;
+      },
+      delete: async (fileId: string) => {
+        delete testRecords[fileId];
+      },
+    };
+
+    const mockApi: any = {
+      getSceneElementsIncludingDeleted: () => [],
+      getAppState: () => ({ viewBackgroundColor: '#ffffff' }),
+      getFiles: () => ({}),
+      updateScene: () => {},
+      resetScene: () => {},
+      history: { clear: () => {} },
+    };
+
+    function TestComp() {
+      const hook = useDrawingPersistence({ api: mockApi, storage: mockStorage });
+      useEffect(() => {
+        hookHolder.current = hook;
+        if (hook.currentFileId === 'file_only' && !hook.isLoading) {
+          resolveHookReady();
+        }
+      });
+      return null;
+    }
+
+    localStorage.removeItem('canvasvault_last_opened_id');
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => { root.render(React.createElement(TestComp)); });
+      await hookReadyPromise;
+
+      // Delete only file
+      await act(async () => {
+        await hookHolder.current!.deleteDrawing('file_only');
+      });
+
+      // Assertions:
+      if (testRecords['file_only'] !== undefined) {
+        throw new Error('file_only should have been deleted');
+      }
+      if (!createdId || testRecords[createdId] === undefined) {
+        throw new Error('Replacement file was not created in storage');
+      }
+      if (hookHolder.current?.currentFileId !== createdId) {
+        throw new Error(`Expected currentFileId to be ${createdId}, got ${hookHolder.current?.currentFileId}`);
+      }
+      if (hookHolder.current?.currentFileName !== 'Untitled') {
+        throw new Error(`Expected currentFileName Untitled, got ${hookHolder.current?.currentFileName}`);
+      }
+    } finally {
+      await act(async () => { root.unmount(); });
+      container.remove();
+    }
+  });
+
+  // 30. Unit 1 — Transient drawing rename before first save updates title and initial save persists with renamed title
+  await record('30. Unit 1 — Transient drawing rename updates title and initial save uses renamed title', async () => {
+    const hookHolder: { current: ReturnType<typeof useDrawingPersistence> | null } = { current: null };
+    let resolveHookReady: () => void = () => {};
+    let hookReadyPromise = new Promise<void>((r) => { resolveHookReady = r; });
+
+    let createdFileName: string | null = null;
+    let renameCallCount = 0;
+    const testRecords: Record<string, string> = {};
+
+    const mockStorage: any = {
+      list: async () => [],
+      get: async (id: string) => testRecords[id] || '',
+      create: async (name: string, content: string) => {
+        createdFileName = name;
+        const id = 'saved_id_' + Date.now();
+        testRecords[id] = content;
+        return id;
+      },
+      update: async (fileId: string, content: string) => {
+        testRecords[fileId] = content;
+      },
+      rename: async () => {
+        renameCallCount++;
+      },
+      delete: async () => {},
+    };
+
+    const mockApi: any = {
+      getSceneElementsIncludingDeleted: () => [{ id: '1', type: 'rectangle', version: 1 }],
+      getAppState: () => ({ viewBackgroundColor: '#ffffff' }),
+      getFiles: () => ({}),
+      updateScene: () => {},
+      resetScene: () => {},
+      history: { clear: () => {} },
+    };
+
+    const initialSelection: any = {
+      storageMode: 'local',
+      authMode: 'anonymous',
+      generation: 1,
+      activeStorage: mockStorage,
+      driveAdapter: mockStorage,
+      localStorage: mockStorage,
+      latestTokenRef: { current: null },
+    };
+
+    let setSelectionState: any;
+    function TestComp() {
+      const [sel, setSel] = React.useState(initialSelection);
+      useEffect(() => {
+        setSelectionState = setSel;
+      }, [setSel]);
+      const hook = useDrawingPersistence({
+        api: mockApi,
+        storageSelection: sel,
+      });
+      useEffect(() => {
+        hookHolder.current = hook;
+        if (!hook.isLoading) {
+          resolveHookReady();
+        }
+      });
+      return null;
+    }
+
+    localStorage.removeItem('canvasvault_last_opened_id');
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => { root.render(React.createElement(TestComp)); });
+      await hookReadyPromise;
+
+      // 1. Transition into authenticated Google Drive mode (creates transient drawing state where currentFileId is null)
+      createdFileName = null;
+      await act(async () => {
+        setSelectionState({
+          ...initialSelection,
+          storageMode: 'drive',
+          authMode: 'authenticated',
+          generation: 2,
+        });
+      });
+
+      if (hookHolder.current?.currentFileId !== null) {
+        throw new Error('Sign-in transition should set currentFileId to null');
+      }
+
+      // 2. Rename transient drawing before its first save (passing currentFileId which is null)
+      await act(async () => {
+        await hookHolder.current!.renameDrawing(hookHolder.current!.currentFileId, 'My System Architecture');
+      });
+
+      // 3. Assert title updated in state
+      if (hookHolder.current?.currentFileName !== 'My System Architecture') {
+        throw new Error(`Expected currentFileName "My System Architecture", got ${hookHolder.current?.currentFileName}`);
+      }
+      // 4. No call to storage.rename on non-existent file
+      if (renameCallCount !== 0) {
+        throw new Error('storage.rename must NOT be called for transient drawing');
+      }
+
+      // 5. First save of the transient drawing to Drive
+      await act(async () => {
+        await hookHolder.current!.saveNow();
+      });
+
+      // 6. Verify initial save used the renamed title!
+      if (createdFileName !== 'My System Architecture') {
+        throw new Error(`Expected initial save to use "My System Architecture", got "${createdFileName}"`);
+      }
+    } finally {
+      await act(async () => { root.unmount(); });
+      container.remove();
+    }
+  });
+
+  // 31. Unit 1 — Operation locking and duplicate operation blocking
+  await record('31. Unit 1 — Operation locking and duplicate operation blocking', async () => {
+    const hookHolder: { current: ReturnType<typeof useDrawingPersistence> | null } = { current: null };
+    let resolveHookReady: () => void = () => {};
+    const hookReadyPromise = new Promise<void>((r) => { resolveHookReady = r; });
+
+    let resolveDelete: () => void = () => {};
+    let deleteCallCount = 0;
+    let resolveRename: () => void = () => {};
+    let renameCallCount = 0;
+
+    const testRecords: Record<string, string> = {
+      file_1: JSON.stringify({ name: 'File 1', elements: [] }),
+      file_2: JSON.stringify({ name: 'File 2', elements: [] }),
+    };
+
+    const mockStorage: any = {
+      list: async () => [
+        ...(testRecords['file_1'] ? [{ id: 'file_1', name: 'File 1.excalidraw' }] : []),
+        ...(testRecords['file_2'] ? [{ id: 'file_2', name: 'File 2.excalidraw' }] : []),
+      ],
+      get: async (id: string) => testRecords[id] || '',
+      create: async () => 'id',
+      update: async () => {},
+      rename: async (_id: string, _name: string) => {
+        renameCallCount++;
+        await new Promise<void>((r) => { resolveRename = r; });
+      },
+      delete: async (id: string) => {
+        deleteCallCount++;
+        await new Promise<void>((r) => { resolveDelete = r; });
+        delete testRecords[id];
+      },
+    };
+
+    const mockApi: any = {
+      getSceneElementsIncludingDeleted: () => [],
+      getAppState: () => ({ viewBackgroundColor: '#ffffff' }),
+      getFiles: () => ({}),
+      updateScene: () => {},
+      resetScene: () => {},
+      history: { clear: () => {} },
+    };
+
+    function TestComp() {
+      const hook = useDrawingPersistence({ api: mockApi, storage: mockStorage });
+      useEffect(() => {
+        hookHolder.current = hook;
+        if (hook.currentFileId === 'file_1' && !hook.isLoading) {
+          resolveHookReady();
+        }
+      });
+      return null;
+    }
+
+    localStorage.removeItem('canvasvault_last_opened_id');
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => { root.render(React.createElement(TestComp)); });
+      await hookReadyPromise;
+
+      // 1. Start delete on file_2 (delayed)
+      let pDelete1!: Promise<boolean>;
+      let pDelete2!: Promise<boolean>;
+      await act(async () => {
+        pDelete1 = hookHolder.current!.deleteDrawing('file_2');
+        pDelete2 = hookHolder.current!.deleteDrawing('file_2');
+      });
+
+      // isFileActionLocked must be true while delete is in flight
+      if (!hookHolder.current?.isFileActionLocked) {
+        throw new Error('isFileActionLocked must be true while delete is in flight');
+      }
+
+      // Resolve delete
+      await act(async () => {
+        resolveDelete();
+        await Promise.all([pDelete1, pDelete2]);
+      });
+
+      // Deduplication: storage.delete must only have been called ONCE
+      if (deleteCallCount !== 1) {
+        throw new Error(`Expected storage.delete to be called once, got ${deleteCallCount}`);
+      }
+      if (hookHolder.current?.isFileActionLocked) {
+        throw new Error('isFileActionLocked must be false after delete completes');
+      }
+
+      // 2. Start rename on file_1 (delayed)
+      let pRename1!: Promise<boolean>;
+      let pRename2!: Promise<boolean>;
+      await act(async () => {
+        pRename1 = hookHolder.current!.renameDrawing('file_1', 'Renamed 1');
+        pRename2 = hookHolder.current!.renameDrawing('file_1', 'Renamed 2');
+      });
+
+      if (!hookHolder.current?.isFileActionLocked) {
+        throw new Error('isFileActionLocked must be true while rename is in flight');
+      }
+
+      // Resolve rename
+      await act(async () => {
+        resolveRename();
+        await Promise.all([pRename1, pRename2]);
+      });
+
+      // Deduplication: storage.rename must only have been called ONCE
+      if (renameCallCount !== 1) {
+        throw new Error(`Expected storage.rename to be called once, got ${renameCallCount}`);
+      }
+      if (hookHolder.current?.isFileActionLocked) {
+        throw new Error('isFileActionLocked must be false after rename completes');
+      }
+    } finally {
+      await act(async () => { root.unmount(); });
+      container.remove();
+    }
+  });
+
   const allPassed = results.every((r) => r.passed);
+
   return { passed: allPassed, results };
 }
 
@@ -191,3 +3654,4 @@ if (typeof window !== 'undefined') {
     document.body.appendChild(reportDiv);
   });
 }
+

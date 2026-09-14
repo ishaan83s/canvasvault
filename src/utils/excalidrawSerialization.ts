@@ -36,17 +36,25 @@ export function stripExcalidrawExtension(name: string): string {
 }
 
 /**
- * Validates whether parsed JSON represents an Excalidraw drawing.
+ * Validates whether JSON data or string represents an Excalidraw drawing.
  */
 export function isValidExcalidrawJson(data: unknown): boolean {
-  if (typeof data !== 'object' || data === null) {
+  let candidate = data;
+  if (typeof candidate === 'string') {
+    try {
+      candidate = JSON.parse(candidate);
+    } catch {
+      return false;
+    }
+  }
+  if (typeof candidate !== 'object' || candidate === null) {
     return false;
   }
-  const candidate = data as Record<string, unknown>;
+  const obj = candidate as Record<string, unknown>;
   // Valid Excalidraw files have type === 'excalidraw' or have an elements array
   return (
-    candidate.type === 'excalidraw' ||
-    Array.isArray(candidate.elements)
+    obj.type === 'excalidraw' ||
+    Array.isArray(obj.elements)
   );
 }
 

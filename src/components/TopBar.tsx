@@ -1,5 +1,7 @@
 import React, { useState } from 'react';
 import { SaveStatus } from './SaveStatus';
+import { GoogleSignInButton } from './GoogleSignInButton';
+import { AuthStatus } from './AuthStatus';
 import type { SaveStatus as StatusType } from '../storage/types';
 
 interface TopBarProps {
@@ -11,6 +13,8 @@ interface TopBarProps {
   onSave: () => void;
   onNew: () => void;
   onRename: (newName: string) => void;
+  onSignOutRequest: () => void;
+  isLocked?: boolean;
 }
 
 export const TopBar: React.FC<TopBarProps> = ({
@@ -22,6 +26,8 @@ export const TopBar: React.FC<TopBarProps> = ({
   onSave,
   onNew,
   onRename,
+  onSignOutRequest,
+  isLocked = false,
 }) => {
   const [isEditingName, setIsEditingName] = useState(false);
   const [nameInput, setNameInput] = useState(currentFileName);
@@ -94,6 +100,7 @@ export const TopBar: React.FC<TopBarProps> = ({
               type="text"
               value={nameInput}
               autoFocus
+              disabled={isLocked}
               onChange={(e) => setNameInput(e.target.value)}
               onBlur={handleNameSubmit}
               onKeyDown={(e) => {
@@ -113,19 +120,26 @@ export const TopBar: React.FC<TopBarProps> = ({
             />
           ) : (
             <span
-              onClick={() => setIsEditingName(true)}
-              title="Click to rename"
+              onClick={() => {
+                if (!isLocked) setIsEditingName(true);
+              }}
+              title={isLocked ? undefined : 'Click to rename'}
               style={{
                 fontSize: '13px',
                 fontWeight: 600,
                 color: '#334155',
-                cursor: 'pointer',
+                cursor: isLocked ? 'not-allowed' : 'pointer',
                 padding: '2px 6px',
                 borderRadius: '4px',
                 border: '1px solid transparent',
+                opacity: isLocked ? 0.7 : 1,
               }}
-              onMouseEnter={(e) => (e.currentTarget.style.borderColor = '#cbd5e1')}
-              onMouseLeave={(e) => (e.currentTarget.style.borderColor = 'transparent')}
+              onMouseEnter={(e) => {
+                if (!isLocked) e.currentTarget.style.borderColor = '#cbd5e1';
+              }}
+              onMouseLeave={(e) => {
+                if (!isLocked) e.currentTarget.style.borderColor = 'transparent';
+              }}
             >
               {currentFileName} ✏️
             </span>
@@ -133,19 +147,21 @@ export const TopBar: React.FC<TopBarProps> = ({
         </div>
       </div>
 
-      <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
         <SaveStatus status={saveStatus} lastSavedAt={lastSavedAt} onRetry={onSave} />
 
         <button
           onClick={onNew}
+          disabled={isLocked}
           style={{
             fontSize: '12px',
             padding: '4px 10px',
             borderRadius: '4px',
             border: '1px solid #cbd5e1',
             backgroundColor: '#ffffff',
-            cursor: 'pointer',
+            cursor: isLocked ? 'not-allowed' : 'pointer',
             fontWeight: 500,
+            opacity: isLocked ? 0.6 : 1,
           }}
         >
           New
@@ -153,7 +169,7 @@ export const TopBar: React.FC<TopBarProps> = ({
 
         <button
           onClick={onSave}
-          disabled={saveStatus === 'saving'}
+          disabled={saveStatus === 'saving' || isLocked}
           style={{
             fontSize: '12px',
             padding: '4px 12px',
@@ -161,12 +177,18 @@ export const TopBar: React.FC<TopBarProps> = ({
             border: 'none',
             backgroundColor: saveStatus === 'dirty' ? '#0284c7' : '#e2e8f0',
             color: saveStatus === 'dirty' ? '#ffffff' : '#475569',
-            cursor: saveStatus === 'saving' ? 'not-allowed' : 'pointer',
+            cursor: saveStatus === 'saving' || isLocked ? 'not-allowed' : 'pointer',
             fontWeight: 600,
+            opacity: isLocked ? 0.6 : 1,
           }}
         >
           Save
         </button>
+
+        <div style={{ width: '1px', height: '20px', backgroundColor: '#e2e8f0', margin: '0 2px' }} />
+
+        <AuthStatus />
+        <GoogleSignInButton onSignOutRequest={onSignOutRequest} />
       </div>
     </header>
   );

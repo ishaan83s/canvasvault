@@ -10,6 +10,7 @@ interface FileSidebarProps {
   onNewFile: () => void;
   onRenameFile: (fileId: string, newName: string) => void;
   onDeleteFile: (fileId: string) => void;
+  isLocked?: boolean;
 }
 
 export const FileSidebar: React.FC<FileSidebarProps> = ({
@@ -20,18 +21,20 @@ export const FileSidebar: React.FC<FileSidebarProps> = ({
   onNewFile,
   onRenameFile,
   onDeleteFile,
+  isLocked = false,
 }) => {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState('');
 
   const startRename = (file: DrawingFile, e: React.MouseEvent) => {
     e.stopPropagation();
+    if (isLocked) return;
     setEditingId(file.id);
     setEditName(stripExcalidrawExtension(file.name));
   };
 
   const submitRename = (fileId: string) => {
-    if (editName.trim()) {
+    if (editName.trim() && !isLocked) {
       onRenameFile(fileId, editName.trim());
     }
     setEditingId(null);
@@ -39,6 +42,7 @@ export const FileSidebar: React.FC<FileSidebarProps> = ({
 
   const handleDelete = (file: DrawingFile, e: React.MouseEvent) => {
     e.stopPropagation();
+    if (isLocked) return;
     const displayName = stripExcalidrawExtension(file.name);
     if (window.confirm(`Are you sure you want to delete "${displayName}"?`)) {
       onDeleteFile(file.id);
@@ -72,16 +76,18 @@ export const FileSidebar: React.FC<FileSidebarProps> = ({
         <span style={{ fontWeight: 600, fontSize: '14px', color: '#334155' }}>My Drawings</span>
         <button
           onClick={onNewFile}
+          disabled={isLocked}
           title="New drawing"
           style={{
             fontSize: '12px',
             fontWeight: 500,
             padding: '4px 8px',
-            backgroundColor: '#0284c7',
+            backgroundColor: isLocked ? '#94a3b8' : '#0284c7',
             color: '#fff',
             border: 'none',
             borderRadius: '4px',
-            cursor: 'pointer',
+            cursor: isLocked ? 'not-allowed' : 'pointer',
+            opacity: isLocked ? 0.7 : 1,
           }}
         >
           + New
@@ -101,18 +107,21 @@ export const FileSidebar: React.FC<FileSidebarProps> = ({
             return (
               <div
                 key={file.id}
-                onClick={() => onSelectFile(file.id)}
+                onClick={() => {
+                  if (!isLocked) onSelectFile(file.id);
+                }}
                 style={{
                   padding: '8px 10px',
                   marginBottom: '4px',
                   borderRadius: '6px',
                   backgroundColor: isSelected ? '#e0f2fe' : 'transparent',
                   border: isSelected ? '1px solid #bae6fd' : '1px solid transparent',
-                  cursor: 'pointer',
+                  cursor: isLocked ? 'not-allowed' : 'pointer',
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'space-between',
                   gap: '6px',
+                  opacity: isLocked ? 0.7 : 1,
                 }}
               >
                 {editingId === file.id ? (
@@ -120,6 +129,7 @@ export const FileSidebar: React.FC<FileSidebarProps> = ({
                     type="text"
                     value={editName}
                     autoFocus
+                    disabled={isLocked}
                     onClick={(e) => e.stopPropagation()}
                     onChange={(e) => setEditName(e.target.value)}
                     onBlur={() => submitRename(file.id)}
@@ -149,28 +159,32 @@ export const FileSidebar: React.FC<FileSidebarProps> = ({
                 <div style={{ display: 'flex', gap: '4px' }}>
                   <button
                     onClick={(e) => startRename(file, e)}
+                    disabled={isLocked}
                     title="Rename"
                     style={{
                       border: 'none',
                       background: 'transparent',
-                      cursor: 'pointer',
+                      cursor: isLocked ? 'not-allowed' : 'pointer',
                       fontSize: '12px',
                       padding: '2px',
                       color: '#64748b',
+                      opacity: isLocked ? 0.4 : 1,
                     }}
                   >
                     ✏️
                   </button>
                   <button
                     onClick={(e) => handleDelete(file, e)}
+                    disabled={isLocked}
                     title="Delete"
                     style={{
                       border: 'none',
                       background: 'transparent',
-                      cursor: 'pointer',
+                      cursor: isLocked ? 'not-allowed' : 'pointer',
                       fontSize: '12px',
                       padding: '2px',
                       color: '#ef4444',
+                      opacity: isLocked ? 0.4 : 1,
                     }}
                   >
                     🗑️
