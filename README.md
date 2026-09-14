@@ -26,7 +26,7 @@ CanvasVault is a browser-based whiteboard application that embeds the official [
   - Save and Create / Discard and Create
 - **Local-to-Google-Drive Migration**: Migrate existing local drawings into Google Drive seamlessly upon authentication.
 - **Concurrency & Race-Condition Protection**: Sequence numbering, generation guards, and operation locking prevent out-of-order writes, stale overwrites, or race conditions during rapid file operations.
-- **Per-User Storage Isolation**: Complete isolation between local guest sessions and authenticated Google accounts.
+- **Per-User Storage Isolation**: Storage is isolated between local guest data and authenticated Google Drive accounts.
 - **Browser-Only Architecture**: Zero custom backend, application server, or hosted database; communicates directly with browser APIs and the Google Drive REST API.
 
 ## Tech Stack
@@ -88,7 +88,7 @@ CanvasVault is designed with a strictly client-side, zero-backend architecture:
 
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/your-username/canvasvault.git
+   git clone https://github.com/ishaan83s/canvasvault.git
    cd canvasvault
    ```
 
@@ -146,7 +146,7 @@ To enable Google Drive persistence, set up an OAuth 2.0 Client ID in the Google 
    - Paste your Client ID into `VITE_GOOGLE_CLIENT_ID` in `.env.local`.
 
 > **Note on Google OAuth Verification**:
-> CanvasVault is currently in public beta and formal Google OAuth application verification may still be pending. If you see a *"Google hasn't verified this app"* warning during sign-in, you can proceed by clicking **Advanced > Go to CanvasVault (unsafe)**, or ensure your Google account is registered under **Test users** in your Google Cloud Console.
+> CanvasVault is currently in public beta and Google OAuth application verification has not yet been completed. If you see a *"Google hasn't verified this app"* warning during sign-in, you can proceed by clicking **Advanced > Go to CanvasVault (unsafe)**, or ensure your Google account is registered under **Test users** in your Google Cloud Console.
 
 ## Available Scripts
 
@@ -160,17 +160,17 @@ To enable Google Drive persistence, set up an OAuth 2.0 Client ID in the Google 
 - **Minimal Google Drive Scope**: CanvasVault requests the `https://www.googleapis.com/auth/drive.file` scope. It only accesses files and folders created by CanvasVault itself and cannot read, alter, or delete any other files in your Google Drive.
 - **No Server Credentials**: Client secrets are not used or needed. Only the public OAuth Web Client ID is used in the browser.
 - **Environment Files Ignored**: `.env` and `.env.*` files are explicitly included in `.gitignore` to prevent leaking local configuration.
-- **Direct Client-to-Google Communication**: All Google Drive API requests are dispatched directly from your browser to Google endpoints. No data ever passes through an intermediate server.
+- **Direct Client-to-Google Communication**: All Google Drive API requests are dispatched directly from your browser to Google endpoints. CanvasVault does not operate a backend that proxies or stores drawing data.
 - **Account Control & Revocation**: OAuth access tokens exist only in browser memory and expire automatically. You can disconnect inside CanvasVault or revoke permissions at any time via your [Google Account Permissions](https://myaccount.google.com/permissions).
 
 ## Current Status
 
-CanvasVault is currently in **Public Beta**. Core drawing functionality, local persistence, Google Drive storage synchronization, migration, and race-condition guards are fully functional and covered by an automated test suite. Google OAuth application verification is currently pending with Google.
+CanvasVault is currently in **Public Beta**. Core drawing functionality, local persistence, Google Drive storage synchronization, migration, and race-condition guards are fully functional and covered by an automated test suite. Google OAuth application verification has not yet been completed.
 
 ## Limitations
 
 - **Browser-Only**: Operates entirely within the browser. Requires direct connectivity to Google APIs when in Google Drive mode; offline changes while in Google Drive mode cannot sync until reconnected.
-- **Google OAuth Verification Warning**: Users may encounter an unverified app warning on the Google consent screen until verification is finalized.
+- **Google OAuth Verification Warning**: Users may encounter an unverified app warning on the Google consent screen until verification is completed.
 - **No Real-Time Collaboration**: Multi-user simultaneous live canvas collaboration is not supported. CanvasVault is designed for individual diagram creation and personal Drive storage.
 
 ## License
