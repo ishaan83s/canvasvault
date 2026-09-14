@@ -3443,7 +3443,9 @@ export async function runPersistenceSelfTests(): Promise<{ passed: boolean; resu
     let setSelectionState: any;
     function TestComp() {
       const [sel, setSel] = React.useState(initialSelection);
-      setSelectionState = setSel;
+      useEffect(() => {
+        setSelectionState = setSel;
+      }, [setSel]);
       const hook = useDrawingPersistence({
         api: mockApi,
         storageSelection: sel,

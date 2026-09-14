@@ -548,7 +548,7 @@ export function useDrawingPersistence({
       activeDeletePromiseRef.current = deletePromise;
       return deletePromise;
     },
-    [api, cancelPendingSave, storage, storageMode, refreshFiles, openDrawing, createNewDrawing, resetToCleanBlankState]
+    [cancelPendingSave, storage, storageMode, refreshFiles, openDrawing, createNewDrawing, resetToCleanBlankState]
   );
 
   const discardUnsavedDriveChanges = useCallback(async () => {
