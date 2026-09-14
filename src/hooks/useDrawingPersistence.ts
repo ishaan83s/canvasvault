@@ -50,8 +50,12 @@ export function useDrawingPersistence({
   const latestLoadRequestIdRef = useRef<number>(0);
   const latestListRequestIdRef = useRef<number>(0);
   const latestSaveRequestIdRef = useRef<number>(0);
+  const latestRenameRequestIdRef = useRef<number>(0);
+  const latestDeleteRequestIdRef = useRef<number>(0);
   const activeSaveAbortControllerRef = useRef<AbortController | null>(null);
   const activeCreatePromiseRef = useRef<Promise<string | null> | null>(null);
+  const activeRenamePromiseRef = useRef<Promise<boolean> | null>(null);
+  const activeDeletePromiseRef = useRef<Promise<boolean> | null>(null);
 
   // Synchronous tracking of current active file ID to prevent duplicate file creations
   const currentFileIdRef = useRef<string | null>(null);
@@ -63,24 +67,25 @@ export function useDrawingPersistence({
   const lastSceneVersionRef = useRef<number>(0);
   const isInitializingRef = useRef<boolean>(true);
 
-  // Refresh files scoped to current storage, generation, and list request sequence
-  const refreshFiles = useCallback(async () => {
+  // Refresh files scoped to current storage, generation, and list request sequence.
+  // Returns null on failure so callers never misinterpret list errors as an empty file list.
+  const refreshFiles = useCallback(async (): Promise<DrawingFile[] | null> => {
     const opGen = storageGenerationRef.current;
     const listRequestId = ++latestListRequestIdRef.current;
     try {
       const list = await storage.list();
       if (opGen !== storageGenerationRef.current || listRequestId !== latestListRequestIdRef.current) {
-        return [];
+        return null;
       }
       setFiles(list);
       return list;
     } catch (err) {
       if (opGen !== storageGenerationRef.current || listRequestId !== latestListRequestIdRef.current) {
-        return [];
+        return null;
       }
       console.error('Failed to list files:', err);
       setErrorMessage(err instanceof Error ? err.message : 'Failed to list drawings');
-      return [];
+      return null;
     }
   }, [storage]);
 
@@ -236,8 +241,8 @@ export function useDrawingPersistence({
 
   // Open a specific drawing with monotonic sequence tracking
   const openDrawing = useCallback(
-    async (fileId: string) => {
-      if (!api) return;
+    async (fileId: string): Promise<boolean> => {
+      if (!api) return false;
 
       cancelPendingSave();
       const opGen = storageGenerationRef.current;
@@ -249,7 +254,7 @@ export function useDrawingPersistence({
       try {
         const rawContent = await storage.get(fileId);
         if (opGen !== storageGenerationRef.current || loadRequestId !== latestLoadRequestIdRef.current) {
-          return;
+          return false;
         }
 
         const restored = deserializeDrawing(rawContent);
@@ -277,10 +282,10 @@ export function useDrawingPersistence({
 
         const fileList = await refreshFiles();
         if (opGen !== storageGenerationRef.current || loadRequestId !== latestLoadRequestIdRef.current) {
-          return;
+          return false;
         }
 
-        const found = fileList.find((f) => f.id === fileId);
+        const found = fileList ? fileList.find((f) => f.id === fileId) : undefined;
         const name = found ? stripExcalidrawExtension(found.name) : 'Untitled';
 
         currentFileIdRef.current = fileId;
@@ -292,12 +297,14 @@ export function useDrawingPersistence({
         if (storageMode === 'local') {
           localStorage.setItem(LAST_OPENED_KEY, fileId);
         }
+        return true;
       } catch (err) {
         if (opGen !== storageGenerationRef.current || loadRequestId !== latestLoadRequestIdRef.current) {
-          return;
+          return false;
         }
         console.error('Failed to open drawing:', err);
         setErrorMessage(err instanceof Error ? err.message : 'Failed to open drawing');
+        return false;
       } finally {
         if (opGen === storageGenerationRef.current && loadRequestId === latestLoadRequestIdRef.current) {
           setIsLoading(false);
@@ -377,73 +384,171 @@ export function useDrawingPersistence({
     [api, cancelPendingSave, storage, storageMode, refreshFiles]
   );
 
-  // Rename drawing with operation status tracking
-  const renameDrawing = useCallback(
-    async (fileId: string, newName: string) => {
-      const opGen = storageGenerationRef.current;
-      setIsFileOperating(true);
-      try {
-        await storage.rename(fileId, newName);
-        if (opGen !== storageGenerationRef.current) {
-          return;
-        }
+  // Helper to reset active scene to clean blank transient Untitled state
+  const resetToCleanBlankState = useCallback(() => {
+    currentFileIdRef.current = null;
+    setCurrentFileId(null);
+    setCurrentFileName('Untitled');
+    lastSavedContentRef.current = '';
+    lastSceneVersionRef.current = 0;
+    if (api) {
+      isInitializingRef.current = true;
+      api.resetScene();
+      api.history.clear();
+      setTimeout(() => {
+        isInitializingRef.current = false;
+      }, 100);
+    }
+    setSaveStatus('saved');
+    if (storageMode === 'local') {
+      localStorage.removeItem(LAST_OPENED_KEY);
+    }
+  }, [api, storageMode]);
 
-        if (fileId === currentFileIdRef.current) {
-          setCurrentFileName(stripExcalidrawExtension(newName));
-        }
-        await refreshFiles();
-      } catch (err) {
-        if (opGen !== storageGenerationRef.current) {
-          return;
-        }
-        console.error('Failed to rename drawing:', err);
-        setErrorMessage(err instanceof Error ? err.message : 'Failed to rename drawing');
-      } finally {
-        if (opGen === storageGenerationRef.current) {
-          setIsFileOperating(false);
-        }
+  // Rename drawing with operation status tracking, request sequencing, and transient drawing support
+  const renameDrawing = useCallback(
+    async (fileId: string | null, newName: string): Promise<boolean> => {
+      const trimmed = newName.trim();
+      const safeDisplayName = stripExcalidrawExtension(trimmed || 'Untitled');
+
+      // Transient drawing rename: active drawing has not been persisted yet (currentFileId is null)
+      if (fileId === null || (fileId === currentFileIdRef.current && currentFileIdRef.current === null)) {
+        setCurrentFileName(safeDisplayName);
+        return true;
       }
+
+      if (activeRenamePromiseRef.current) {
+        return activeRenamePromiseRef.current;
+      }
+
+      const opGen = storageGenerationRef.current;
+      const renameRequestId = ++latestRenameRequestIdRef.current;
+      setIsFileOperating(true);
+
+      const renamePromise = (async (): Promise<boolean> => {
+        try {
+          await storage.rename(fileId, newName);
+          if (opGen !== storageGenerationRef.current || renameRequestId !== latestRenameRequestIdRef.current) {
+            return false;
+          }
+
+          if (fileId === currentFileIdRef.current) {
+            setCurrentFileName(safeDisplayName);
+          }
+          await refreshFiles();
+          return (
+            opGen === storageGenerationRef.current &&
+            renameRequestId === latestRenameRequestIdRef.current
+          );
+        } catch (err) {
+          if (opGen !== storageGenerationRef.current || renameRequestId !== latestRenameRequestIdRef.current) {
+            return false;
+          }
+          console.error('Failed to rename drawing:', err);
+          setErrorMessage(err instanceof Error ? err.message : 'Failed to rename drawing');
+          return false;
+        } finally {
+          activeRenamePromiseRef.current = null;
+          if (opGen === storageGenerationRef.current && renameRequestId === latestRenameRequestIdRef.current) {
+            setIsFileOperating(false);
+          }
+        }
+      })();
+
+      activeRenamePromiseRef.current = renamePromise;
+      return renamePromise;
     },
     [storage, refreshFiles]
   );
 
-  // Delete drawing with operation status tracking and debounce cancellation
+  // Delete drawing with operation status tracking, inactive save isolation, and explicit fallback semantics
   const deleteDrawing = useCallback(
-    async (fileId: string) => {
-      cancelPendingSave();
+    async (fileId: string): Promise<boolean> => {
+      if (activeDeletePromiseRef.current) {
+        return activeDeletePromiseRef.current;
+      }
+
+      const isActive = fileId === currentFileIdRef.current;
+
+      // 1. Inactive delete must NOT cancel active-file saves! Only cancel when deleting active file.
+      if (isActive) {
+        cancelPendingSave();
+      }
+
       const opGen = storageGenerationRef.current;
+      const deleteRequestId = ++latestDeleteRequestIdRef.current;
       setIsFileOperating(true);
-      try {
-        await storage.delete(fileId);
-        if (opGen !== storageGenerationRef.current) {
-          return;
-        }
 
-        const updatedList = await refreshFiles();
-        if (opGen !== storageGenerationRef.current) {
-          return;
-        }
+      const deletePromise = (async (): Promise<boolean> => {
+        try {
+          await storage.delete(fileId);
+          if (opGen !== storageGenerationRef.current || deleteRequestId !== latestDeleteRequestIdRef.current) {
+            return false;
+          }
 
-        if (fileId === currentFileIdRef.current) {
-          if (updatedList.length > 0) {
-            await openDrawing(updatedList[0].id);
-          } else {
-            await createNewDrawing('Untitled');
+          // 2. Safe active-file deletion: purge active identity immediately upon deletion
+          if (isActive) {
+            currentFileIdRef.current = null;
+            setCurrentFileId(null);
+            lastSavedContentRef.current = '';
+            lastSceneVersionRef.current = 0;
+            if (storageMode === 'local') {
+              localStorage.removeItem(LAST_OPENED_KEY);
+            }
+          }
+
+          const updatedList = await refreshFiles();
+          if (opGen !== storageGenerationRef.current || deleteRequestId !== latestDeleteRequestIdRef.current) {
+            return false;
+          }
+
+          // 3. Fallback semantics when active file was deleted:
+          if (isActive) {
+            if (updatedList === null) {
+              // Active delete -> list failure: NEVER create replacement! Clean blank state + error
+              resetToCleanBlankState();
+              setErrorMessage((prev) => prev || 'Failed to refresh file list after delete');
+              return true;
+            }
+
+            if (updatedList.length > 0) {
+              // Active delete -> non-empty list: open fallback
+              const opened = await openDrawing(updatedList[0].id);
+              if (!opened || currentFileIdRef.current === null) {
+                // Active delete -> fallback open failure: NEVER retain deleted ID! Clean blank state + error
+                resetToCleanBlankState();
+                setErrorMessage((prev) => prev || 'Failed to open fallback drawing after delete');
+              }
+            } else {
+              // Active delete -> empty list: create replacement for final remaining file
+              const newId = await createNewDrawing('Untitled');
+              if (!newId) {
+                // Active delete -> replacement creation failure: currentFileId remains null
+                resetToCleanBlankState();
+              }
+            }
+          }
+
+          return true;
+        } catch (err) {
+          if (opGen !== storageGenerationRef.current || deleteRequestId !== latestDeleteRequestIdRef.current) {
+            return false;
+          }
+          console.error('Failed to delete drawing:', err);
+          setErrorMessage(err instanceof Error ? err.message : 'Failed to delete drawing');
+          return false;
+        } finally {
+          activeDeletePromiseRef.current = null;
+          if (opGen === storageGenerationRef.current && deleteRequestId === latestDeleteRequestIdRef.current) {
+            setIsFileOperating(false);
           }
         }
-      } catch (err) {
-        if (opGen !== storageGenerationRef.current) {
-          return;
-        }
-        console.error('Failed to delete drawing:', err);
-        setErrorMessage(err instanceof Error ? err.message : 'Failed to delete drawing');
-      } finally {
-        if (opGen === storageGenerationRef.current) {
-          setIsFileOperating(false);
-        }
-      }
+      })();
+
+      activeDeletePromiseRef.current = deletePromise;
+      return deletePromise;
     },
-    [storage, refreshFiles, openDrawing, createNewDrawing, cancelPendingSave]
+    [api, cancelPendingSave, storage, storageMode, refreshFiles, openDrawing, createNewDrawing, resetToCleanBlankState]
   );
 
   const discardUnsavedDriveChanges = useCallback(async () => {
@@ -528,7 +633,7 @@ export function useDrawingPersistence({
       (async () => {
         try {
           const localList = await refreshFiles();
-          if (storageGenerationRef.current !== generation) return;
+          if (storageGenerationRef.current !== generation || localList === null) return;
 
           const lastOpenedId = localStorage.getItem(LAST_OPENED_KEY);
           const targetFile = localList.find((f) => f.id === lastOpenedId) || localList[0];
@@ -570,6 +675,11 @@ export function useDrawingPersistence({
       try {
         const list = await refreshFiles();
         if (opGen !== storageGenerationRef.current) return;
+        if (list === null) {
+          // List request failed on initial startup (e.g. Drive network failure / token issue)
+          // Do NOT interpret as empty list or create new drawing!
+          return;
+        }
 
         const lastOpenedId = storageMode === 'local' ? localStorage.getItem(LAST_OPENED_KEY) : null;
         const targetFile = list.find((f) => f.id === lastOpenedId) || list[0];
@@ -590,6 +700,8 @@ export function useDrawingPersistence({
     initialize();
   }, [api, storageMode, refreshFiles, openDrawing, createNewDrawing]);
 
+  const isFileActionLocked = isFileOperating || isOpeningFile || isLoading;
+
   return {
     files,
     currentFileId,
@@ -600,6 +712,7 @@ export function useDrawingPersistence({
     isDebouncing,
     isOpeningFile,
     isFileOperating,
+    isFileActionLocked,
     isSignOutSafe:
       storageMode !== 'drive' ||
       (!isSaving && !isDebouncing && !isOpeningFile && !isFileOperating && saveStatus !== 'dirty' && saveStatus !== 'error' && saveStatus !== 'saving'),

@@ -3002,6 +3002,636 @@ export async function runPersistenceSelfTests(): Promise<{ passed: boolean; resu
     }
   });
 
+  // 26. Unit 1 — Inactive file deletion must not cancel or interrupt active-file pending/in-flight saves
+  await record('26. Unit 1 — Inactive file deletion must not cancel active-file in-flight saves', async () => {
+    const hookHolder: { current: ReturnType<typeof useDrawingPersistence> | null } = { current: null };
+    let resolveHookReady: () => void = () => {};
+    const hookReadyPromise = new Promise<void>((r) => { resolveHookReady = r; });
+
+    let resolveSaveA: () => void = () => {};
+    let saveSignalA: AbortSignal | undefined;
+    const testRecords: Record<string, string> = {
+      file_A: JSON.stringify({ name: 'File A', elements: [{ id: '1', type: 'rectangle' }] }),
+      file_B: JSON.stringify({ name: 'File B', elements: [{ id: '2', type: 'ellipse' }] }),
+    };
+
+    const mockStorage: any = {
+      list: async () => [
+        { id: 'file_A', name: 'File A.excalidraw' },
+        ...(testRecords['file_B'] ? [{ id: 'file_B', name: 'File B.excalidraw' }] : []),
+      ],
+      get: async (id: string) => testRecords[id] || '',
+      create: async (_name: string, content: string) => {
+        const id = 'created_' + Date.now();
+        testRecords[id] = content;
+        return id;
+      },
+      update: async (fileId: string, content: string, signal?: AbortSignal) => {
+        if (fileId === 'file_A') {
+          saveSignalA = signal;
+          await new Promise<void>((r) => { resolveSaveA = r; });
+          if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+        }
+        testRecords[fileId] = content;
+      },
+      delete: async (fileId: string) => {
+        delete testRecords[fileId];
+      },
+    };
+
+    const mockApi: any = {
+      getSceneElementsIncludingDeleted: () => [{ id: '1', type: 'rectangle', version: 3 }],
+      getAppState: () => ({ viewBackgroundColor: '#ffffff' }),
+      getFiles: () => ({}),
+      updateScene: () => {},
+      resetScene: () => {},
+      history: { clear: () => {} },
+    };
+
+    function TestComp() {
+      const hook = useDrawingPersistence({ api: mockApi, storage: mockStorage });
+      useEffect(() => {
+        hookHolder.current = hook;
+        if (hook.currentFileId === 'file_A' && !hook.isLoading) {
+          resolveHookReady();
+        }
+      });
+      return null;
+    }
+
+    localStorage.removeItem('canvasvault_last_opened_id');
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => { root.render(React.createElement(TestComp)); });
+      await hookReadyPromise;
+
+      // 1. Start saveNow() for File A
+      let saveOutcome: boolean | null = null;
+      let pSave!: Promise<boolean>;
+      await act(async () => {
+        pSave = hookHolder.current!.saveNow();
+      });
+
+      if (!hookHolder.current?.isSaving) {
+        throw new Error('Save on File A should be in flight');
+      }
+
+      // 2. While File A save is in flight, delete inactive File B
+      await act(async () => {
+        await hookHolder.current!.deleteDrawing('file_B');
+      });
+
+      // Verify File B was deleted
+      if (testRecords['file_B'] !== undefined) {
+        throw new Error('File B should have been deleted from storage');
+      }
+
+      // CRITICAL ASSERTION: File A's in-flight save must NOT be aborted!
+      if (saveSignalA?.aborted) {
+        throw new Error('CRITICAL BUG: Inactive delete aborted active file AbortSignal!');
+      }
+
+      // 3. Release File A save
+      await act(async () => {
+        resolveSaveA();
+        saveOutcome = await pSave;
+      });
+
+      if (saveOutcome !== true) {
+        throw new Error('Active file save should have succeeded');
+      }
+      if (hookHolder.current?.currentFileId !== 'file_A') {
+        throw new Error('Active file should remain file_A');
+      }
+      if (hookHolder.current?.saveStatus !== 'saved') {
+        throw new Error('Active file saveStatus should be saved');
+      }
+    } finally {
+      await act(async () => { root.unmount(); });
+      container.remove();
+    }
+  });
+
+  // 27. Unit 1 — Safe active delete and fallback open failure handling
+  await record('27. Unit 1 — Active delete fallback open failure clears active ID and resets to clean blank state', async () => {
+    const hookHolder: { current: ReturnType<typeof useDrawingPersistence> | null } = { current: null };
+    let resolveHookReady: () => void = () => {};
+    const hookReadyPromise = new Promise<void>((r) => { resolveHookReady = r; });
+
+    let resetSceneCalled = false;
+    const testRecords: Record<string, string> = {
+      file_A: JSON.stringify({ name: 'File A', elements: [{ id: '1', type: 'rectangle' }] }),
+      file_B: JSON.stringify({ name: 'File B', elements: [{ id: '2', type: 'ellipse' }] }),
+    };
+
+    const mockStorage: any = {
+      list: async () => [
+        ...(testRecords['file_A'] ? [{ id: 'file_A', name: 'File A.excalidraw' }] : []),
+        ...(testRecords['file_B'] ? [{ id: 'file_B', name: 'File B.excalidraw' }] : []),
+      ],
+      get: async (id: string) => {
+        if (id === 'file_B') {
+          throw new Error('Simulated network disconnect when opening fallback');
+        }
+        return testRecords[id] || '';
+      },
+      create: async (_name: string, content: string) => {
+        const id = 'created_' + Date.now();
+        testRecords[id] = content;
+        return id;
+      },
+      update: async (fileId: string, content: string) => {
+        testRecords[fileId] = content;
+      },
+      delete: async (fileId: string) => {
+        delete testRecords[fileId];
+      },
+    };
+
+    const mockApi: any = {
+      getSceneElementsIncludingDeleted: () => [],
+      getAppState: () => ({ viewBackgroundColor: '#ffffff' }),
+      getFiles: () => ({}),
+      updateScene: () => {},
+      resetScene: () => { resetSceneCalled = true; },
+      history: { clear: () => {} },
+    };
+
+    function TestComp() {
+      const hook = useDrawingPersistence({ api: mockApi, storage: mockStorage });
+      useEffect(() => {
+        hookHolder.current = hook;
+        if (hook.currentFileId === 'file_A' && !hook.isLoading) {
+          resolveHookReady();
+        }
+      });
+      return null;
+    }
+
+    localStorage.removeItem('canvasvault_last_opened_id');
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => { root.render(React.createElement(TestComp)); });
+      await hookReadyPromise;
+
+      // Delete active File A where fallback File B will fail to open
+      await act(async () => {
+        await hookHolder.current!.deleteDrawing('file_A');
+      });
+
+      // Assertions:
+      // 1. File A was deleted from storage
+      if (testRecords['file_A'] !== undefined) {
+        throw new Error('File A should be deleted from storage');
+      }
+      // 2. active file ID is null (NOT file_A)
+      if (hookHolder.current?.currentFileId !== null) {
+        throw new Error(`Expected currentFileId to be null, got ${hookHolder.current?.currentFileId}`);
+      }
+      // 3. Canvas was reset
+      if (!resetSceneCalled) {
+        throw new Error('Canvas should have been reset on fallback open failure');
+      }
+      // 4. File name is Untitled
+      if (hookHolder.current?.currentFileName !== 'Untitled') {
+        throw new Error(`Expected currentFileName Untitled, got ${hookHolder.current?.currentFileName}`);
+      }
+      // 5. Error message was populated
+      if (!hookHolder.current?.errorMessage) {
+        throw new Error('Expected errorMessage to be populated with failure details');
+      }
+    } finally {
+      await act(async () => { root.unmount(); });
+      container.remove();
+    }
+  });
+
+  // 28. Unit 1 — Active delete when refresh/list fails does NOT create replacement drawing
+  await record('28. Unit 1 — Active delete when refresh/list fails does NOT create replacement drawing', async () => {
+    const hookHolder: { current: ReturnType<typeof useDrawingPersistence> | null } = { current: null };
+    let resolveHookReady: () => void = () => {};
+    const hookReadyPromise = new Promise<void>((r) => { resolveHookReady = r; });
+
+    let createCallCount = 0;
+    let listFailMode = false;
+    const testRecords: Record<string, string> = {
+      file_A: JSON.stringify({ name: 'File A', elements: [{ id: '1', type: 'rectangle' }] }),
+      file_B: JSON.stringify({ name: 'File B', elements: [{ id: '2', type: 'ellipse' }] }),
+    };
+
+    const mockStorage: any = {
+      list: async () => {
+        if (listFailMode) {
+          throw new Error('Google Drive 500: listManagedFiles failed');
+        }
+        return [
+          ...(testRecords['file_A'] ? [{ id: 'file_A', name: 'File A.excalidraw' }] : []),
+          ...(testRecords['file_B'] ? [{ id: 'file_B', name: 'File B.excalidraw' }] : []),
+        ];
+      },
+      get: async (id: string) => testRecords[id] || '',
+      create: async (_name: string, content: string) => {
+        createCallCount++;
+        const id = 'created_' + Date.now();
+        testRecords[id] = content;
+        return id;
+      },
+      update: async (fileId: string, content: string) => {
+        testRecords[fileId] = content;
+      },
+      delete: async (fileId: string) => {
+        delete testRecords[fileId];
+      },
+    };
+
+    const mockApi: any = {
+      getSceneElementsIncludingDeleted: () => [],
+      getAppState: () => ({ viewBackgroundColor: '#ffffff' }),
+      getFiles: () => ({}),
+      updateScene: () => {},
+      resetScene: () => {},
+      history: { clear: () => {} },
+    };
+
+    function TestComp() {
+      const hook = useDrawingPersistence({ api: mockApi, storage: mockStorage });
+      useEffect(() => {
+        hookHolder.current = hook;
+        if (hook.currentFileId === 'file_A' && !hook.isLoading) {
+          resolveHookReady();
+        }
+      });
+      return null;
+    }
+
+    localStorage.removeItem('canvasvault_last_opened_id');
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => { root.render(React.createElement(TestComp)); });
+      await hookReadyPromise;
+
+      // Enable list failure mode
+      listFailMode = true;
+
+      // Delete active File A
+      await act(async () => {
+        await hookHolder.current!.deleteDrawing('file_A');
+      });
+
+      // Assertions:
+      // 1. File A was deleted
+      if (testRecords['file_A'] !== undefined) {
+        throw new Error('File A should have been deleted');
+      }
+      // 2. CRITICAL: createNewDrawing must NOT be called on list failure!
+      if (createCallCount !== 0) {
+        throw new Error(`CRITICAL BUG: List failure triggered createNewDrawing! createCallCount=${createCallCount}`);
+      }
+      // 3. active file ID is null
+      if (hookHolder.current?.currentFileId !== null) {
+        throw new Error(`Expected currentFileId to be null, got ${hookHolder.current?.currentFileId}`);
+      }
+      // 4. Error message is populated
+      if (!hookHolder.current?.errorMessage) {
+        throw new Error('Expected errorMessage to be populated with list failure details');
+      }
+    } finally {
+      await act(async () => { root.unmount(); });
+      container.remove();
+    }
+  });
+
+  // 29. Unit 1 — Deleting the final remaining file creates replacement correctly
+  await record('29. Unit 1 — Deleting final remaining file with empty list creates replacement correctly', async () => {
+    const hookHolder: { current: ReturnType<typeof useDrawingPersistence> | null } = { current: null };
+    let resolveHookReady: () => void = () => {};
+    const hookReadyPromise = new Promise<void>((r) => { resolveHookReady = r; });
+
+    let createdId: string | null = null;
+    const testRecords: Record<string, string> = {
+      file_only: JSON.stringify({ name: 'Only File', elements: [{ id: '1', type: 'rectangle' }] }),
+    };
+
+    const mockStorage: any = {
+      list: async () => {
+        return Object.keys(testRecords).map((id) => ({ id, name: id + '.excalidraw' }));
+      },
+      get: async (id: string) => testRecords[id] || '',
+      create: async (_name: string, content: string) => {
+        const id = 'replacement_file_' + Date.now();
+        createdId = id;
+        testRecords[id] = content;
+        return id;
+      },
+      update: async (fileId: string, content: string) => {
+        testRecords[fileId] = content;
+      },
+      delete: async (fileId: string) => {
+        delete testRecords[fileId];
+      },
+    };
+
+    const mockApi: any = {
+      getSceneElementsIncludingDeleted: () => [],
+      getAppState: () => ({ viewBackgroundColor: '#ffffff' }),
+      getFiles: () => ({}),
+      updateScene: () => {},
+      resetScene: () => {},
+      history: { clear: () => {} },
+    };
+
+    function TestComp() {
+      const hook = useDrawingPersistence({ api: mockApi, storage: mockStorage });
+      useEffect(() => {
+        hookHolder.current = hook;
+        if (hook.currentFileId === 'file_only' && !hook.isLoading) {
+          resolveHookReady();
+        }
+      });
+      return null;
+    }
+
+    localStorage.removeItem('canvasvault_last_opened_id');
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => { root.render(React.createElement(TestComp)); });
+      await hookReadyPromise;
+
+      // Delete only file
+      await act(async () => {
+        await hookHolder.current!.deleteDrawing('file_only');
+      });
+
+      // Assertions:
+      if (testRecords['file_only'] !== undefined) {
+        throw new Error('file_only should have been deleted');
+      }
+      if (!createdId || testRecords[createdId] === undefined) {
+        throw new Error('Replacement file was not created in storage');
+      }
+      if (hookHolder.current?.currentFileId !== createdId) {
+        throw new Error(`Expected currentFileId to be ${createdId}, got ${hookHolder.current?.currentFileId}`);
+      }
+      if (hookHolder.current?.currentFileName !== 'Untitled') {
+        throw new Error(`Expected currentFileName Untitled, got ${hookHolder.current?.currentFileName}`);
+      }
+    } finally {
+      await act(async () => { root.unmount(); });
+      container.remove();
+    }
+  });
+
+  // 30. Unit 1 — Transient drawing rename before first save updates title and initial save persists with renamed title
+  await record('30. Unit 1 — Transient drawing rename updates title and initial save uses renamed title', async () => {
+    const hookHolder: { current: ReturnType<typeof useDrawingPersistence> | null } = { current: null };
+    let resolveHookReady: () => void = () => {};
+    let hookReadyPromise = new Promise<void>((r) => { resolveHookReady = r; });
+
+    let createdFileName: string | null = null;
+    let renameCallCount = 0;
+    const testRecords: Record<string, string> = {};
+
+    const mockStorage: any = {
+      list: async () => [],
+      get: async (id: string) => testRecords[id] || '',
+      create: async (name: string, content: string) => {
+        createdFileName = name;
+        const id = 'saved_id_' + Date.now();
+        testRecords[id] = content;
+        return id;
+      },
+      update: async (fileId: string, content: string) => {
+        testRecords[fileId] = content;
+      },
+      rename: async () => {
+        renameCallCount++;
+      },
+      delete: async () => {},
+    };
+
+    const mockApi: any = {
+      getSceneElementsIncludingDeleted: () => [{ id: '1', type: 'rectangle', version: 1 }],
+      getAppState: () => ({ viewBackgroundColor: '#ffffff' }),
+      getFiles: () => ({}),
+      updateScene: () => {},
+      resetScene: () => {},
+      history: { clear: () => {} },
+    };
+
+    const initialSelection: any = {
+      storageMode: 'local',
+      authMode: 'anonymous',
+      generation: 1,
+      activeStorage: mockStorage,
+      driveAdapter: mockStorage,
+      localStorage: mockStorage,
+      latestTokenRef: { current: null },
+    };
+
+    let setSelectionState: any;
+    function TestComp() {
+      const [sel, setSel] = React.useState(initialSelection);
+      setSelectionState = setSel;
+      const hook = useDrawingPersistence({
+        api: mockApi,
+        storageSelection: sel,
+      });
+      useEffect(() => {
+        hookHolder.current = hook;
+        if (!hook.isLoading) {
+          resolveHookReady();
+        }
+      });
+      return null;
+    }
+
+    localStorage.removeItem('canvasvault_last_opened_id');
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => { root.render(React.createElement(TestComp)); });
+      await hookReadyPromise;
+
+      // 1. Transition into authenticated Google Drive mode (creates transient drawing state where currentFileId is null)
+      createdFileName = null;
+      await act(async () => {
+        setSelectionState({
+          ...initialSelection,
+          storageMode: 'drive',
+          authMode: 'authenticated',
+          generation: 2,
+        });
+      });
+
+      if (hookHolder.current?.currentFileId !== null) {
+        throw new Error('Sign-in transition should set currentFileId to null');
+      }
+
+      // 2. Rename transient drawing before its first save (passing currentFileId which is null)
+      await act(async () => {
+        await hookHolder.current!.renameDrawing(hookHolder.current!.currentFileId, 'My System Architecture');
+      });
+
+      // 3. Assert title updated in state
+      if (hookHolder.current?.currentFileName !== 'My System Architecture') {
+        throw new Error(`Expected currentFileName "My System Architecture", got ${hookHolder.current?.currentFileName}`);
+      }
+      // 4. No call to storage.rename on non-existent file
+      if (renameCallCount !== 0) {
+        throw new Error('storage.rename must NOT be called for transient drawing');
+      }
+
+      // 5. First save of the transient drawing to Drive
+      await act(async () => {
+        await hookHolder.current!.saveNow();
+      });
+
+      // 6. Verify initial save used the renamed title!
+      if (createdFileName !== 'My System Architecture') {
+        throw new Error(`Expected initial save to use "My System Architecture", got "${createdFileName}"`);
+      }
+    } finally {
+      await act(async () => { root.unmount(); });
+      container.remove();
+    }
+  });
+
+  // 31. Unit 1 — Operation locking and duplicate operation blocking
+  await record('31. Unit 1 — Operation locking and duplicate operation blocking', async () => {
+    const hookHolder: { current: ReturnType<typeof useDrawingPersistence> | null } = { current: null };
+    let resolveHookReady: () => void = () => {};
+    const hookReadyPromise = new Promise<void>((r) => { resolveHookReady = r; });
+
+    let resolveDelete: () => void = () => {};
+    let deleteCallCount = 0;
+    let resolveRename: () => void = () => {};
+    let renameCallCount = 0;
+
+    const testRecords: Record<string, string> = {
+      file_1: JSON.stringify({ name: 'File 1', elements: [] }),
+      file_2: JSON.stringify({ name: 'File 2', elements: [] }),
+    };
+
+    const mockStorage: any = {
+      list: async () => [
+        ...(testRecords['file_1'] ? [{ id: 'file_1', name: 'File 1.excalidraw' }] : []),
+        ...(testRecords['file_2'] ? [{ id: 'file_2', name: 'File 2.excalidraw' }] : []),
+      ],
+      get: async (id: string) => testRecords[id] || '',
+      create: async () => 'id',
+      update: async () => {},
+      rename: async (_id: string, _name: string) => {
+        renameCallCount++;
+        await new Promise<void>((r) => { resolveRename = r; });
+      },
+      delete: async (id: string) => {
+        deleteCallCount++;
+        await new Promise<void>((r) => { resolveDelete = r; });
+        delete testRecords[id];
+      },
+    };
+
+    const mockApi: any = {
+      getSceneElementsIncludingDeleted: () => [],
+      getAppState: () => ({ viewBackgroundColor: '#ffffff' }),
+      getFiles: () => ({}),
+      updateScene: () => {},
+      resetScene: () => {},
+      history: { clear: () => {} },
+    };
+
+    function TestComp() {
+      const hook = useDrawingPersistence({ api: mockApi, storage: mockStorage });
+      useEffect(() => {
+        hookHolder.current = hook;
+        if (hook.currentFileId === 'file_1' && !hook.isLoading) {
+          resolveHookReady();
+        }
+      });
+      return null;
+    }
+
+    localStorage.removeItem('canvasvault_last_opened_id');
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => { root.render(React.createElement(TestComp)); });
+      await hookReadyPromise;
+
+      // 1. Start delete on file_2 (delayed)
+      let pDelete1!: Promise<boolean>;
+      let pDelete2!: Promise<boolean>;
+      await act(async () => {
+        pDelete1 = hookHolder.current!.deleteDrawing('file_2');
+        pDelete2 = hookHolder.current!.deleteDrawing('file_2');
+      });
+
+      // isFileActionLocked must be true while delete is in flight
+      if (!hookHolder.current?.isFileActionLocked) {
+        throw new Error('isFileActionLocked must be true while delete is in flight');
+      }
+
+      // Resolve delete
+      await act(async () => {
+        resolveDelete();
+        await Promise.all([pDelete1, pDelete2]);
+      });
+
+      // Deduplication: storage.delete must only have been called ONCE
+      if (deleteCallCount !== 1) {
+        throw new Error(`Expected storage.delete to be called once, got ${deleteCallCount}`);
+      }
+      if (hookHolder.current?.isFileActionLocked) {
+        throw new Error('isFileActionLocked must be false after delete completes');
+      }
+
+      // 2. Start rename on file_1 (delayed)
+      let pRename1!: Promise<boolean>;
+      let pRename2!: Promise<boolean>;
+      await act(async () => {
+        pRename1 = hookHolder.current!.renameDrawing('file_1', 'Renamed 1');
+        pRename2 = hookHolder.current!.renameDrawing('file_1', 'Renamed 2');
+      });
+
+      if (!hookHolder.current?.isFileActionLocked) {
+        throw new Error('isFileActionLocked must be true while rename is in flight');
+      }
+
+      // Resolve rename
+      await act(async () => {
+        resolveRename();
+        await Promise.all([pRename1, pRename2]);
+      });
+
+      // Deduplication: storage.rename must only have been called ONCE
+      if (renameCallCount !== 1) {
+        throw new Error(`Expected storage.rename to be called once, got ${renameCallCount}`);
+      }
+      if (hookHolder.current?.isFileActionLocked) {
+        throw new Error('isFileActionLocked must be false after rename completes');
+      }
+    } finally {
+      await act(async () => { root.unmount(); });
+      container.remove();
+    }
+  });
+
   const allPassed = results.every((r) => r.passed);
 
   return { passed: allPassed, results };

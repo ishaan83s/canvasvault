@@ -159,6 +159,9 @@ function MainLayout() {
     persistence.isDebouncing;
 
   const handleSelectFileRequest = (fileId: string) => {
+    if (persistence.isFileActionLocked) {
+      return;
+    }
     // If clicking currently active file, no-op!
     if (fileId === persistence.currentFileId) {
       return;
@@ -175,6 +178,9 @@ function MainLayout() {
   };
 
   const handleNewDrawingRequest = () => {
+    if (persistence.isFileActionLocked) {
+      return;
+    }
     if (isSceneUnsaved) {
       setSwitchSaveError(null);
       setPendingSwitchAction({ type: 'new' });
@@ -253,11 +259,10 @@ function MainLayout() {
         onSave={persistence.saveNow}
         onNew={handleNewDrawingRequest}
         onRename={(newName) => {
-          if (persistence.currentFileId) {
-            persistence.renameDrawing(persistence.currentFileId, newName);
-          }
+          persistence.renameDrawing(persistence.currentFileId, newName);
         }}
         onSignOutRequest={handleSignOutRequest}
+        isLocked={persistence.isFileActionLocked}
       />
       <div style={{ display: 'flex', flex: 1, height: 'calc(100vh - 44px)', overflow: 'hidden' }}>
         <FileSidebar
@@ -268,6 +273,7 @@ function MainLayout() {
           onNewFile={handleNewDrawingRequest}
           onRenameFile={persistence.renameDrawing}
           onDeleteFile={persistence.deleteDrawing}
+          isLocked={persistence.isFileActionLocked}
         />
         <main className="canvas-container">
           {persistence.errorMessage && (
